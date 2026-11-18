@@ -730,7 +730,7 @@ pub fn prepare_grpc_completion_prompts(
             echo: request.echo,
             logprobs: request.logprobs,
             prompt_logprobs,
-            echo_only: request.max_tokens == Some(0),
+            echo_only: request.echo && request.max_tokens == Some(0),
             return_tokens_as_token_ids,
             logprob_token_ids,
             echo_text: None,
@@ -1343,6 +1343,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(proto.stopping.unwrap().max_new_tokens, 1);
+
+        // Without `echo` the same request asks for zero tokens: vLLM only
+        // turns `echo` + `max_tokens: 0` into a one-token request.
+        let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1, 2], "max_tokens": 0
+        })))
+        .unwrap();
+        assert!(!lowered.options.echo_only);
+        let proto = chat_to_generate_request_with_options(
+            &lowered.chat,
+            vec![1, 2],
+            "r".into(),
+            Some(&lowered.options),
+        )
+        .unwrap();
+        assert_eq!(proto.stopping.unwrap().max_new_tokens, 0);
     }
 
     #[test]

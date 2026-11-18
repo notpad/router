@@ -67,6 +67,11 @@ pub struct MockVllmRs {
     pub frame_logprobs: Option<Vec<FrameLogprobs>>,
     /// Emit one `-0.1` prompt logprob per prompt token in `PromptInfo`.
     pub emit_prompt_logprobs: bool,
+    /// A request for zero new tokens gets a single empty finish frame, as a
+    /// real engine answers `max_tokens: 0`. Off by default: `max_new_tokens`
+    /// is 0 for most requests (the client set no limit), so this must never
+    /// apply unless a test asks for it.
+    pub zero_max_tokens_returns_empty: bool,
     pub capture_limit: usize,
     pub failures_remaining: Arc<AtomicUsize>,
     /// Returned in `FinishInfo.kv_transfer_params`, as a P/D prefill engine does.
@@ -139,6 +144,7 @@ impl Default for MockVllmRs {
             frames: None,
             frame_logprobs: None,
             emit_prompt_logprobs: false,
+            zero_max_tokens_returns_empty: false,
             capture_limit: usize::MAX,
             failures_remaining: Arc::new(AtomicUsize::new(0)),
             finish_kv_transfer_params: None,
@@ -255,6 +261,11 @@ impl Inference for MockVllmRs {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let req = request.into_inner();
+        let max_new_tokens = req
+            .stopping
+            .as_ref()
+            .map(|stopping| stopping.max_new_tokens)
+            .unwrap_or(0);
         let (token_ids, had_text_prompt) = match req.prompt {
             Some(generate_request::Prompt::TokenIds(TokenIds { ids })) => (ids, false),
             Some(generate_request::Prompt::Text(_)) => (Vec::new(), true),
@@ -300,10 +311,13 @@ impl Inference for MockVllmRs {
         }
 
         let (tx, rx) = mpsc::channel(4);
-        let frames = self
-            .frames
-            .clone()
-            .unwrap_or_else(|| vec![(self.reply_text.clone(), vec![7, 8, 9])]);
+        let frames = if self.zero_max_tokens_returns_empty && max_new_tokens == 0 {
+            vec![(String::new(), Vec::new())]
+        } else {
+            self.frames
+                .clone()
+                .unwrap_or_else(|| vec![(self.reply_text.clone(), vec![7, 8, 9])])
+        };
         let n_prompt = token_ids.len() as u32;
         let finish_kv = self
             .finish_kv_transfer_params

@@ -388,6 +388,7 @@ async fn grpc_completion_echo_with_max_tokens_zero_returns_the_prompt_only() {
 
     let state = MockVllmRs {
         emit_prompt_logprobs: true,
+        zero_max_tokens_returns_empty: true,
         ..Default::default()
     };
     let model = fixture::model_fixture();
@@ -450,6 +451,10 @@ async fn grpc_completion_echo_with_max_tokens_zero_returns_the_prompt_only() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["choices"][0]["text"], "");
     assert!(json["choices"][0]["logprobs"].is_null());
+    // Without `echo` the engine is asked for zero tokens, and the reply
+    // reports zero completion tokens, matching vLLM HTTP.
+    assert_eq!(worker.captured().last().unwrap().max_new_tokens, 0);
+    assert_eq!(json["usage"]["completion_tokens"], 0);
 }
 
 #[tokio::test]
