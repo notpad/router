@@ -541,6 +541,104 @@ async fn grpc_completion_logprobs_echo_streams_per_chunk() {
 }
 
 #[tokio::test]
+async fn grpc_completion_late_prompt_info_streams_in_a_later_chunk() {
+    use axum::body::to_bytes;
+    use common::mock_vllm_rs::{FrameLogprobs, MockVllmRs};
+    use vllm_router_rs::config::{PolicyConfig, RouterConfig};
+    use vllm_router_rs::routers::http::router::Router;
+
+    // PromptInfo arrives after the first output frame, as a
+    // non-conforming engine might send it.
+    let state = MockVllmRs {
+        frames: Some(vec![
+            ("".to_string(), vec![7, 8]),
+            ("".to_string(), vec![9]),
+        ]),
+        frame_logprobs: Some(vec![
+            FrameLogprobs {
+                logprobs: vec![-0.5, -0.6],
+                ranks: vec![1, 1],
+                candidates: vec![],
+            },
+            FrameLogprobs {
+                logprobs: vec![-0.7],
+                ranks: vec![1],
+                candidates: vec![],
+            },
+        ]),
+        emit_prompt_logprobs: true,
+        prompt_info_after_first_frame: true,
+        ..Default::default()
+    };
+    let model = fixture::model_fixture();
+    let worker = common::mock_vllm_rs::MockVllmRsServer::spawn_with_state(state).await;
+    let config = RouterConfig {
+        policy: PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        },
+        disable_circuit_breaker: true,
+        ..Default::default()
+    };
+    let context = common::create_test_context(config);
+    let router = Router::new(vec![worker.grpc_url.clone()], &context)
+        .await
+        .unwrap();
+
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": "hello prefix",
+        "logprobs": 2,
+        "echo": true,
+        "stream": true,
+    }))
+    .unwrap();
+    let response = router
+        .route_typed_request(None, &request, "/v1/completions", None)
+        .await;
+    assert!(response.status().is_success());
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    let chunks: Vec<serde_json::Value> = text
+        .split("\n\n")
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    assert!(!chunks.is_empty(), "{text}");
+    // The first chunk carries only the first frame's output logprobs:
+    // PromptInfo had not arrived yet.
+    let first = &chunks[0]["choices"][0];
+    assert_eq!(
+        first["logprobs"]["token_logprobs"],
+        json!([-0.5, -0.6]),
+        "{first}"
+    );
+    // A later chunk merges the prompt logprobs in front of its output
+    // logprobs (first prompt position null, rest -0.1) instead of
+    // losing them.
+    let merged = chunks
+        .iter()
+        .find(|chunk| {
+            chunk["choices"][0]["logprobs"]["token_logprobs"]
+                .as_array()
+                .is_some_and(|values| values.first().is_some_and(|value| value.is_null()))
+        })
+        .expect("prompt logprobs merged into a later chunk");
+    let values = merged["choices"][0]["logprobs"]["token_logprobs"]
+        .as_array()
+        .unwrap();
+    assert_eq!(values[values.len() - 1], json!(-0.7));
+    assert!(values[1..values.len() - 1]
+        .iter()
+        .all(|value| *value == json!(-0.1)));
+}
+
+#[tokio::test]
 async fn grpc_completion_echo_with_truncated_text_prompt_stays_aligned() {
     use axum::body::to_bytes;
     use common::mock_vllm_rs::{FrameLogprobs, MockVllmRs};

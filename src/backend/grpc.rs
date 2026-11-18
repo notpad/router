@@ -743,6 +743,9 @@ async fn stream_openai(
                 .collect();
             let mut detoks: Vec<Option<Box<dyn IncrementalDecoderTrait + '_>>> = Vec::new();
             let mut prompt_logprobs: Option<LogProbs> = None;
+            // Prompt logprobs merge into the first chunk that carries output
+            // logprobs, once they have arrived.
+            let mut prompt_logprobs_sent = false;
             let mut prompt_tokens = prompt_ids.len() as u32;
             let mut completion_tokens = 0u32;
             let mut first = true;
@@ -862,8 +865,20 @@ async fn stream_openai(
                                 chunk_logprobs = prompt_logprobs.clone();
                             }
                         } else if want_logprobs {
-                            let mut logprobs = if echo_now {
-                                prompt_logprobs.clone().unwrap_or_else(empty_logprobs)
+                            // Prompt logprobs merge into the first chunk
+                            // that carries output logprobs. PromptInfo is
+                            // documented to arrive in the first response,
+                            // but an engine may send it later; holding the
+                            // merge until it arrives keeps the prompt
+                            // entries instead of losing them.
+                            let mut logprobs = if !prompt_logprobs_sent {
+                                match &prompt_logprobs {
+                                    Some(prompt) => {
+                                        prompt_logprobs_sent = true;
+                                        prompt.clone()
+                                    }
+                                    None => empty_logprobs(),
+                                }
                             } else {
                                 empty_logprobs()
                             };

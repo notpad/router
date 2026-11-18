@@ -67,6 +67,9 @@ pub struct MockVllmRs {
     pub frame_logprobs: Option<Vec<FrameLogprobs>>,
     /// Emit one `-0.1` prompt logprob per prompt token in `PromptInfo`.
     pub emit_prompt_logprobs: bool,
+    /// Send `PromptInfo` after the first output frame instead of before it,
+    /// as a non-conforming engine might.
+    pub prompt_info_after_first_frame: bool,
     /// A request for zero new tokens gets a single empty finish frame, as a
     /// real engine answers `max_tokens: 0`. Off by default: `max_new_tokens`
     /// is 0 for most requests (the client set no limit), so this must never
@@ -144,6 +147,7 @@ impl Default for MockVllmRs {
             frames: None,
             frame_logprobs: None,
             emit_prompt_logprobs: false,
+            prompt_info_after_first_frame: false,
             zero_max_tokens_returns_empty: false,
             capture_limit: usize::MAX,
             failures_remaining: Arc::new(AtomicUsize::new(0)),
@@ -327,6 +331,7 @@ impl Inference for MockVllmRs {
         let cancelled = self.cancelled.clone();
         let frame_logprobs = self.frame_logprobs.clone();
         let emit_prompt_logprobs = self.emit_prompt_logprobs;
+        let prompt_info_after_first_frame = self.prompt_info_after_first_frame;
         let fail_stream = self
             .stream_failures_remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
@@ -348,25 +353,26 @@ impl Inference for MockVllmRs {
                     return;
                 }
             }
-            let _ = tx
-                .send(Ok(GenerateResponse {
-                    prompt_info: Some(PromptInfo {
-                        num_prompt_tokens: n_prompt,
-                        logprobs: if emit_prompt_logprobs {
-                            vec![-0.1; n_prompt as usize]
-                        } else {
-                            Vec::new()
-                        },
-                        ranks: if emit_prompt_logprobs {
-                            vec![1; n_prompt as usize]
-                        } else {
-                            Vec::new()
-                        },
-                        ..Default::default()
-                    }),
-                    outputs: None,
-                }))
-                .await;
+            let prompt_info = || GenerateResponse {
+                prompt_info: Some(PromptInfo {
+                    num_prompt_tokens: n_prompt,
+                    logprobs: if emit_prompt_logprobs {
+                        vec![-0.1; n_prompt as usize]
+                    } else {
+                        Vec::new()
+                    },
+                    ranks: if emit_prompt_logprobs {
+                        vec![1; n_prompt as usize]
+                    } else {
+                        Vec::new()
+                    },
+                    ..Default::default()
+                }),
+                outputs: None,
+            };
+            if !prompt_info_after_first_frame {
+                let _ = tx.send(Ok(prompt_info())).await;
+            }
             if fail_stream {
                 let _ = tx.send(Err(Status::internal("decode failed"))).await;
                 return;
@@ -411,6 +417,9 @@ impl Inference for MockVllmRs {
                     .await;
                 if sent.is_err() {
                     break;
+                }
+                if prompt_info_after_first_frame && index == 0 {
+                    let _ = tx.send(Ok(prompt_info())).await;
                 }
             }
         });
