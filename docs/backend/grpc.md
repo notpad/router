@@ -62,10 +62,17 @@ or implied by `echo` + `logprobs`, onto `prompt_logprobs` + candidates, with
 the reply rebuilds OpenAI `logprobs` per sequence (`tokens`,
 `token_logprobs`, `top_logprobs`, `text_offset`, `-inf` clamped to `-9999`,
 first prompt position `null`). Streaming with an explicit
-`prompt_logprobs` and no `logprobs` is rejected with 400: the streaming
-path would otherwise drop the prompt logprobs silently. `logprobs` is
+`prompt_logprobs` is rejected with 400 unless `echo` is set (vLLM rejects
+it outright); without echo the streaming merge would overlap prompt and
+output entries, and under `echo` without `logprobs` the reply carries no
+logprobs at all. `logprobs` is
 0–20; vLLM's `-1` (all tokens) is not a valid value here — the field is
-an unsigned count, so `-1` fails request parsing with 400. `echo` prefixes the prompt text and shifts
+an unsigned count, so `-1` fails request parsing with 400. Non-streaming
+explicit `prompt_logprobs` without `logprobs` still returns the prompt
+logprobs when `echo` is set (including `echo` + `max_tokens: 0`); without
+`echo` they are not returned. This is deliberate — an explicit request is
+honored where the reply has a place for it — where vLLM returns
+`logprobs: null` whenever `logprobs` is unset. `echo` prefixes the prompt text and shifts
 `text_offset`; `echo` + `max_tokens: 0` answers with the prompt only, the one
 token the engine had to generate being dropped. Logprobs and echo live on
 the regular-pool path only: the gRPC P/D route still rejects them with 400,
