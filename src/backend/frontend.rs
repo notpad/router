@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 
 use axum::response::Response;
 
-use super::convert::{prepare_grpc_completion_prompts, CompletionPrompt};
+use super::convert::{prepare_grpc_completion_prompts, CompletionOptions, CompletionPrompt};
 use super::grpc::{FirstOutputCallback, GrpcEngineBackend, KvHandoff};
 use super::l1_encode_cache::{L1CacheConfig, L1CacheStats};
 use super::preprocess::{
-    tokenize_chat_request_timed, tokenize_completion_text, FrontendHandle, TokenizeOut,
-    TokenizerCache,
+    decode_completion_text, tokenize_chat_request_timed, tokenize_completion_text, FrontendHandle,
+    TokenizeOut, TokenizerCache,
 };
 use crate::protocols::spec::{ChatCompletionRequest, CompletionRequest};
 use crate::tokenizer::{TokenizerCacheConfig, TokenizerCacheStats};
@@ -58,6 +58,8 @@ pub struct PreparedRequest {
     pub shape: ResponseShape,
     /// Client opted in with `return_token_ids`; ids are withheld otherwise.
     pub emit_token_ids: bool,
+    /// `/v1/completions` options (`echo`, `logprobs`, …); `None` for chat.
+    pub completion: Option<CompletionOptions>,
 }
 
 /// Load-once tokenizer + tonic client. One replica per router process.
@@ -172,6 +174,7 @@ impl EngineFrontend {
             t_req,
             shape: ResponseShape::Chat,
             emit_token_ids: false,
+            completion: None,
         })
     }
 
@@ -194,7 +197,9 @@ impl EngineFrontend {
         let crate::backend::convert::PreparedCompletionPrompts {
             mut chat,
             prompts,
+            echo_texts,
             emit_token_ids,
+            options,
         } = lowered;
         let add_special_tokens = match request.other.get("add_special_tokens") {
             None => true,
@@ -211,7 +216,7 @@ impl EngineFrontend {
             .map(str::to_string);
         let chat = Arc::new(chat);
         let mut prepared = Vec::with_capacity(prompts.len());
-        for prompt in prompts {
+        for (prompt, echo_text) in prompts.into_iter().zip(echo_texts) {
             let mut tokenized = match prompt {
                 CompletionPrompt::Ids(ids) => TokenizeOut {
                     token_ids: Arc::from(ids),
@@ -237,6 +242,22 @@ impl EngineFrontend {
                 ));
             }
             truncate_grpc_prompt(chat.as_ref(), &mut tokenized)?;
+            // Text prompts already carry the client string; id prompts get
+            // their echo text decoded here, after truncation, so the reply
+            // echoes exactly the ids that were dispatched.
+            let echo_text = if options.echo {
+                match echo_text {
+                    Some(text) => Some(text),
+                    None => decode_completion_text(
+                        &handle,
+                        &tokenized.token_ids,
+                        chat.skip_special_tokens,
+                    )
+                    .map_err(|error| PrepareError::Unavailable(error.to_string()))?,
+                }
+            } else {
+                None
+            };
             prepared.push(PreparedRequest {
                 request: chat.clone(),
                 tokenized,
@@ -245,6 +266,10 @@ impl EngineFrontend {
                 t_req,
                 shape: ResponseShape::Completion,
                 emit_token_ids,
+                completion: Some(CompletionOptions {
+                    echo_text,
+                    ..options.clone()
+                }),
             });
         }
         Ok(prepared)
@@ -277,6 +302,7 @@ impl EngineFrontend {
             t_req,
             shape: ResponseShape::Completion,
             emit_token_ids,
+            completion: None,
         })
     }
 

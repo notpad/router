@@ -739,6 +739,21 @@ pub fn tokenize_completion_text(
     }
 }
 
+/// Decode prompt ids back to text for `echo`; test pins have no tokenizer.
+pub fn decode_completion_text(
+    frontend: &FrontendHandle,
+    ids: &[u32],
+    skip_special_tokens: bool,
+) -> anyhow::Result<Option<String>> {
+    match frontend.tokenizer() {
+        None => Ok(None),
+        Some(tokenizer) => tokenizer
+            .decode(ids, skip_special_tokens)
+            .map(Some)
+            .map_err(|error| anyhow!("completion prompt detokenization failed: {error}")),
+    }
+}
+
 fn tokenize_vllm(request: &ChatCompletionRequest, frontend: &VllmFrontend) -> Result<TokenizeOut> {
     if request
         .tools
