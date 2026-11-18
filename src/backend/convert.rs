@@ -665,16 +665,24 @@ pub fn prepare_grpc_completion_prompts(
                 })?,
         ),
     };
-    // vLLM rejects streaming explicit `prompt_logprobs` outright. The
-    // router keeps it only under `echo`, where the prompt logprobs have
-    // a well-defined place: they precede the echoed output and the
-    // offsets stay correct. Without echo the streaming merge would
-    // overlap prompt and output entries (both start at offset 0) and
-    // the prompt's leading null would pose as the first output token,
-    // while the non-streaming path does not merge there at all.
-    // Non-streaming keeps the merge.
-    if request.stream && prompt_logprobs.is_some() && !request.echo {
-        return Err("streaming prompt_logprobs requires echo".to_string());
+    // Explicit `prompt_logprobs` needs a logprobs object to carry it
+    // and `echo` for the prompt text/offset context: without either
+    // there is nowhere to put the entries, so the request is rejected
+    // instead of accepted and silently dropped. Streaming follows the
+    // vLLM rule and rejects a positive count (or -1) outright; only 0
+    // is allowed there, asking for the sampled token per prompt
+    // position with no extra candidates. The implied count (`echo` +
+    // `logprobs`, no explicit value) is not affected by this check.
+    if let Some(explicit) = prompt_logprobs {
+        if request.logprobs.is_none() {
+            return Err("prompt_logprobs requires logprobs".to_string());
+        }
+        if !request.echo {
+            return Err("prompt_logprobs requires echo".to_string());
+        }
+        if request.stream && (explicit > 0 || prompt_logprobs_all) {
+            return Err("streaming prompt_logprobs must be 0".to_string());
+        }
     }
     if let Some(top_n) = request.logprobs {
         if top_n > 20 {
@@ -1264,9 +1272,9 @@ mod tests {
         ));
 
         // Explicit `prompt_logprobs: -1` asks for every prompt position:
-        // all candidates per token.
+        // all candidates per token. It needs `logprobs` and `echo`.
         let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
-            "prompt": [1, 2], "prompt_logprobs": -1
+            "prompt": [1, 2], "logprobs": 2, "echo": true, "prompt_logprobs": -1
         })))
         .unwrap();
         assert_eq!(lowered.options.prompt_logprobs, Some(0));
@@ -1284,7 +1292,7 @@ mod tests {
             response.prompt_candidates.and_then(|c| c.select),
             Some(pb::candidate_tokens::Select::All(true))
         ));
-        assert!(!response.output_logprobs);
+        assert!(response.output_logprobs);
 
         // `logprob_token_ids` selects ids instead of top-N for the output.
         let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
@@ -1355,40 +1363,52 @@ mod tests {
         .unwrap_err();
         assert!(bad_type.contains("array"), "{bad_type}");
 
-        // Streaming explicit `prompt_logprobs` without `echo` is
-        // rejected, with or without `logprobs`: the streaming merge
-        // would overlap prompt and output entries at offset 0.
-        for with_logprobs in [false, true] {
-            let mut value = serde_json::json!({
-                "prompt": [1], "prompt_logprobs": 2, "stream": true
-            });
-            if with_logprobs {
-                value["logprobs"] = serde_json::json!(2);
-            }
-            let streaming_prompt_logprobs =
-                prepare_grpc_completion_prompts(&completion(value)).unwrap_err();
-            assert!(
-                streaming_prompt_logprobs.contains("streaming prompt_logprobs"),
-                "{streaming_prompt_logprobs}"
-            );
+        // Explicit `prompt_logprobs` requires `logprobs` and `echo`, on
+        // every path: without either there is nowhere to put the
+        // entries, so the request is rejected instead of accepted and
+        // dropped. The logprobs check reports first.
+        for (value, message) in [
+            (
+                serde_json::json!({"prompt": [1], "prompt_logprobs": 2, "echo": true}),
+                "prompt_logprobs requires logprobs",
+            ),
+            (
+                serde_json::json!({"prompt": [1], "prompt_logprobs": 2, "logprobs": 2}),
+                "prompt_logprobs requires echo",
+            ),
+            (
+                serde_json::json!({"prompt": [1], "prompt_logprobs": 2, "echo": true, "stream": true}),
+                "prompt_logprobs requires logprobs",
+            ),
+            (
+                serde_json::json!({"prompt": [1], "prompt_logprobs": 2, "logprobs": 2, "stream": true}),
+                "prompt_logprobs requires echo",
+            ),
+        ] {
+            let err = prepare_grpc_completion_prompts(&completion(value)).unwrap_err();
+            assert!(err.contains(message), "{err}");
         }
 
-        // The same request is fine non-streaming, and streaming under
-        // `echo` keeps the prompt-logprobs merge, with or without
-        // `logprobs`.
+        // Streaming rejects a positive explicit count (or -1) outright,
+        // following vLLM; only 0 is allowed there.
+        for value in [-1, 2] {
+            let err = prepare_grpc_completion_prompts(&completion(serde_json::json!({
+                "prompt": [1], "prompt_logprobs": value, "logprobs": 2, "echo": true, "stream": true
+            })))
+            .unwrap_err();
+            assert!(err.contains("streaming prompt_logprobs must be 0"), "{err}");
+        }
+
+        // The same count is fine non-streaming, and streaming allows 0
+        // (sampled token per prompt position, no extra candidates).
         prepare_grpc_completion_prompts(&completion(serde_json::json!({
-            "prompt": [1], "prompt_logprobs": 2
+            "prompt": [1], "prompt_logprobs": 2, "logprobs": 2, "echo": true
         })))
         .unwrap();
-        for with_logprobs in [false, true] {
-            let mut value = serde_json::json!({
-                "prompt": [1], "prompt_logprobs": 2, "echo": true, "stream": true
-            });
-            if with_logprobs {
-                value["logprobs"] = serde_json::json!(2);
-            }
-            prepare_grpc_completion_prompts(&completion(value)).unwrap();
-        }
+        prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1], "prompt_logprobs": 0, "logprobs": 2, "echo": true, "stream": true
+        })))
+        .unwrap();
     }
 
     #[test]
