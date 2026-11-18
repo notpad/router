@@ -247,6 +247,56 @@ async fn grpc_completion_batched_prompts_are_rejected_before_tokenize() {
 }
 
 #[tokio::test]
+async fn grpc_completion_streaming_prompt_logprobs_without_echo_is_rejected() {
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use vllm_router_rs::config::{PolicyConfig, RouterConfig};
+    use vllm_router_rs::routers::http::router::Router;
+
+    let model = fixture::model_fixture();
+    let worker = common::mock_vllm_rs::MockVllmRsServer::spawn().await;
+    let config = RouterConfig {
+        policy: PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        },
+        disable_circuit_breaker: true,
+        ..Default::default()
+    };
+    let context = common::create_test_context(config);
+    let router = Router::new(vec![worker.grpc_url.clone()], &context)
+        .await
+        .unwrap();
+
+    // Non-echo streaming with explicit `prompt_logprobs` is rejected
+    // even when `logprobs` is set: the streaming merge would overlap
+    // prompt and output entries at offset 0, so the request never
+    // reaches the engine and no prompt logprobs can leak into a chunk.
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": "hello prefix",
+        "logprobs": 2,
+        "prompt_logprobs": 2,
+        "stream": true,
+    }))
+    .unwrap();
+    let response = router
+        .route_typed_request(None, &request, "/v1/completions", None)
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("streaming prompt_logprobs"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(worker.captured().is_empty());
+}
+
+#[tokio::test]
 async fn grpc_completion_logprobs_echo_round_trip() {
     use axum::body::to_bytes;
     use common::mock_vllm_rs::{FrameLogprobs, MockVllmRs};
