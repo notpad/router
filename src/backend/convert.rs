@@ -263,7 +263,7 @@ pub fn chat_to_generate_request_with_options(
 /// Prompt logprobs the completion frontend asks the engine for: an explicit
 /// `prompt_logprobs` wins, otherwise `echo` + `logprobs` implies it, matching
 /// the HTTP frontend's `prompt_logprobs = logprobs` default.
-fn completion_prompt_logprobs(options: &CompletionOptions) -> Option<u32> {
+pub(crate) fn completion_prompt_logprobs(options: &CompletionOptions) -> Option<u32> {
     options
         .prompt_logprobs
         .or(options.logprobs.filter(|_| options.echo))

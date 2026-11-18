@@ -20,8 +20,9 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::convert::{
-    chat_to_generate_request, chat_to_generate_request_with_options, limit_to_prefill,
-    proto_struct_to_json, requires_worker_output_text, set_kv_transfer_params, CompletionOptions,
+    chat_to_generate_request, chat_to_generate_request_with_options, completion_prompt_logprobs,
+    limit_to_prefill, proto_struct_to_json, requires_worker_output_text, set_kv_transfer_params,
+    CompletionOptions,
 };
 use super::detect::{grpc_connect_uri, parse_dp_rank};
 use super::frontend::{PreparedRequest, ResponseShape};
@@ -723,6 +724,13 @@ async fn stream_openai(
         .as_ref()
         .is_some_and(|options| options.return_tokens_as_token_ids);
     let echo_only = completion.as_ref().is_some_and(|options| options.echo_only);
+    // Prompt logprobs are merged only when the request asked for them
+    // (explicit `prompt_logprobs`, or `echo` + `logprobs`); an engine that
+    // sends them unrequested must not leak them into the reply.
+    let want_prompt_logprobs = completion
+        .as_ref()
+        .and_then(completion_prompt_logprobs)
+        .is_some();
     let header_stages = stages.clone();
     let stages_on = crate::backend::stages_enabled();
     let (tx, rx) = mpsc::unbounded_channel::<Result<String, std::io::Error>>();
@@ -763,7 +771,7 @@ async fn stream_openai(
                         }
                         if let Some(info) = &msg.prompt_info {
                             prompt_tokens = info.num_prompt_tokens;
-                            if prompt_logprobs.is_none() {
+                            if want_prompt_logprobs && prompt_logprobs.is_none() {
                                 match prompt_logprobs_from_info(
                                     info,
                                     &prompt_ids,
@@ -1052,6 +1060,13 @@ async fn collect_openai(
     let as_token_ids = completion
         .as_ref()
         .is_some_and(|options| options.return_tokens_as_token_ids);
+    // Prompt logprobs are merged only when the request asked for them
+    // (explicit `prompt_logprobs`, or `echo` + `logprobs`); an engine that
+    // sends them unrequested must not leak them into the reply.
+    let want_prompt_logprobs = completion
+        .as_ref()
+        .and_then(completion_prompt_logprobs)
+        .is_some();
     let mut sequences: Vec<SequenceAccum> = (0..n_choices.max(1))
         .map(|_| SequenceAccum::new(echo_len))
         .collect();
@@ -1080,7 +1095,7 @@ async fn collect_openai(
                 }
                 if let Some(info) = &msg.prompt_info {
                     prompt_tokens = info.num_prompt_tokens;
-                    if prompt_logprobs.is_none() {
+                    if want_prompt_logprobs && prompt_logprobs.is_none() {
                         prompt_logprobs = Some(
                             match prompt_logprobs_from_info(
                                 info,
