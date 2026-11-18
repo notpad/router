@@ -271,10 +271,10 @@ async fn grpc_completion_streaming_prompt_logprobs_without_echo_is_rejected() {
         .await
         .unwrap();
 
-    // Non-echo streaming with explicit `prompt_logprobs` is rejected
-    // even when `logprobs` is set: the streaming merge would overlap
-    // prompt and output entries at offset 0, so the request never
-    // reaches the engine and no prompt logprobs can leak into a chunk.
+    // Non-echo streaming with explicit `prompt_logprobs` is rejected:
+    // an explicit count requires `echo` for the prompt text/offset
+    // context, so the request never reaches the engine and no prompt
+    // logprobs can leak into a chunk.
     let request: CompletionRequest = serde_json::from_value(json!({
         "model": model.path().to_str().unwrap(),
         "prompt": "hello prefix",
@@ -289,11 +289,214 @@ async fn grpc_completion_streaming_prompt_logprobs_without_echo_is_rejected() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert!(
-        String::from_utf8_lossy(&body).contains("streaming prompt_logprobs"),
+        String::from_utf8_lossy(&body).contains("prompt_logprobs requires echo"),
         "{}",
         String::from_utf8_lossy(&body)
     );
     assert!(worker.captured().is_empty());
+}
+
+#[tokio::test]
+async fn grpc_completion_explicit_prompt_logprobs_validation_rejects_over_http() {
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+    use vllm_router_rs::config::{PolicyConfig, RouterConfig};
+    use vllm_router_rs::routers::http::router::Router;
+
+    let model = fixture::model_fixture();
+    let worker = common::mock_vllm_rs::MockVllmRsServer::spawn().await;
+    let config = RouterConfig {
+        policy: PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        },
+        disable_circuit_breaker: true,
+        ..Default::default()
+    };
+    let context = common::create_test_context(config);
+    let router = Router::new(vec![worker.grpc_url.clone()], &context)
+        .await
+        .unwrap();
+
+    // Every rejected combination answers 400 naming the failing
+    // condition, on both paths, and never reaches the engine.
+    for (mut body, message) in [
+        (
+            json!({"prompt_logprobs": 2, "echo": true}),
+            "prompt_logprobs requires logprobs",
+        ),
+        (
+            json!({"prompt_logprobs": 2, "logprobs": 2}),
+            "prompt_logprobs requires echo",
+        ),
+        (
+            json!({"prompt_logprobs": 2, "echo": true, "stream": true}),
+            "prompt_logprobs requires logprobs",
+        ),
+        (
+            json!({"prompt_logprobs": 2, "logprobs": 2, "stream": true}),
+            "prompt_logprobs requires echo",
+        ),
+        (
+            json!({"prompt_logprobs": 2, "logprobs": 2, "echo": true, "stream": true}),
+            "streaming prompt_logprobs must be 0",
+        ),
+        (
+            json!({"prompt_logprobs": -1, "logprobs": 2, "echo": true, "stream": true}),
+            "streaming prompt_logprobs must be 0",
+        ),
+    ] {
+        body["model"] = json!(model.path().to_str().unwrap());
+        body["prompt"] = json!("hello prefix");
+        let request: CompletionRequest = serde_json::from_value(body).unwrap();
+        let response = router
+            .route_typed_request(None, &request, "/v1/completions", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains(message),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    assert!(worker.captured().is_empty());
+}
+
+#[tokio::test]
+async fn grpc_completion_explicit_prompt_logprobs_zero_streams_and_merges() {
+    use axum::body::to_bytes;
+    use common::mock_vllm_rs::{FrameLogprobs, MockVllmRs};
+    use vllm_router_rs::backend::pb::candidate_tokens;
+    use vllm_router_rs::config::{PolicyConfig, RouterConfig};
+    use vllm_router_rs::routers::http::router::Router;
+
+    let state = MockVllmRs {
+        frames: Some(vec![
+            ("".to_string(), vec![7, 8]),
+            ("".to_string(), vec![9]),
+        ]),
+        frame_logprobs: Some(vec![
+            FrameLogprobs {
+                logprobs: vec![-0.5, -0.6],
+                ranks: vec![1, 1],
+                candidates: vec![],
+            },
+            FrameLogprobs {
+                logprobs: vec![-0.7],
+                ranks: vec![1],
+                candidates: vec![],
+            },
+        ]),
+        emit_prompt_logprobs: true,
+        ..Default::default()
+    };
+    let model = fixture::model_fixture();
+    let worker = common::mock_vllm_rs::MockVllmRsServer::spawn_with_state(state).await;
+    let config = RouterConfig {
+        policy: PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        },
+        disable_circuit_breaker: true,
+        ..Default::default()
+    };
+    let context = common::create_test_context(config);
+    let router = Router::new(vec![worker.grpc_url.clone()], &context)
+        .await
+        .unwrap();
+
+    // Streaming with explicit `prompt_logprobs: 0` is the one streaming
+    // value allowed: the sampled token per prompt position, no extra
+    // candidates. The prompt entries merge into the first chunk like
+    // any other echo + logprobs request.
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": "hello prefix",
+        "logprobs": 2,
+        "echo": true,
+        "prompt_logprobs": 0,
+        "stream": true,
+    }))
+    .unwrap();
+    let response = router
+        .route_typed_request(None, &request, "/v1/completions", None)
+        .await;
+    assert!(response.status().is_success());
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    let chunks: Vec<serde_json::Value> = text
+        .split("\n\n")
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    assert!(!chunks.is_empty(), "{text}");
+    let first = &chunks[0]["choices"][0];
+    assert!(
+        first["text"].as_str().unwrap().starts_with("hello prefix"),
+        "{first}"
+    );
+    let first_logprobs = first["logprobs"]["token_logprobs"].as_array().unwrap();
+    assert!(first_logprobs[0].is_null());
+    assert_eq!(first_logprobs[first_logprobs.len() - 2], json!(-0.5));
+    assert_eq!(first_logprobs[first_logprobs.len() - 1], json!(-0.6));
+    // The wire request asked for prompt logprobs with no candidates:
+    // 0 means the sampled token only.
+    let captured = worker.captured();
+    let options = captured[0].response_options.as_ref().unwrap();
+    assert!(options.prompt_logprobs);
+    assert!(options.prompt_candidates.is_none());
+    assert!(matches!(
+        options
+            .output_candidates
+            .as_ref()
+            .and_then(|c| c.select.clone()),
+        Some(candidate_tokens::Select::TopN(2))
+    ));
+
+    // Non-streaming with an explicit positive count merges the same
+    // way: prompt entries first, output entries last.
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": "hello prefix",
+        "logprobs": 2,
+        "echo": true,
+        "prompt_logprobs": 2,
+    }))
+    .unwrap();
+    let response = router
+        .route_typed_request(None, &request, "/v1/completions", None)
+        .await;
+    assert!(response.status().is_success());
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let choice = &json["choices"][0];
+    let token_logprobs = choice["logprobs"]["token_logprobs"].as_array().unwrap();
+    assert!(token_logprobs[0].is_null());
+    assert_eq!(
+        &token_logprobs[token_logprobs.len() - 3..],
+        &[json!(-0.5), json!(-0.6), json!(-0.7)]
+    );
+    assert!(token_logprobs[1..token_logprobs.len() - 3]
+        .iter()
+        .all(|value| *value == json!(-0.1)));
+    let captured = worker.captured();
+    let options = captured[1].response_options.as_ref().unwrap();
+    assert!(matches!(
+        options
+            .prompt_candidates
+            .as_ref()
+            .and_then(|c| c.select.clone()),
+        Some(candidate_tokens::Select::TopN(2))
+    ));
 }
 
 #[tokio::test]
