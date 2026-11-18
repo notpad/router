@@ -20,22 +20,23 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::convert::{
-    chat_to_generate_request, limit_to_prefill, proto_struct_to_json, requires_worker_output_text,
-    set_kv_transfer_params,
+    chat_to_generate_request, chat_to_generate_request_with_options, limit_to_prefill,
+    proto_struct_to_json, requires_worker_output_text, set_kv_transfer_params, CompletionOptions,
 };
 use super::detect::{grpc_connect_uri, parse_dp_rank};
 use super::frontend::{PreparedRequest, ResponseShape};
 use super::openai::{
-    completion_final_response, final_response, finish_reason_name, now_secs, sse_chunk,
-    sse_usage_chunk, SSE_DONE,
+    completion_response, final_response, finish_reason_name, now_secs, sse_chunk, sse_usage_chunk,
+    SSE_DONE,
 };
+use super::pb;
 use super::pb::control_client::ControlClient;
 use super::pb::finish_info::FinishReason;
 use super::pb::inference_client::InferenceClient;
 use super::pb::AbortRequest;
 use super::stream_output::{output_frame_tracking, OutputFrameConsumer, OutputFrameProducer};
 use super::vllm_frontend::{decode_stream, emit_detok, DynTokenizer, IncrementalDecoderTrait};
-use crate::protocols::spec::Usage;
+use crate::protocols::spec::{CompletionChoice, LogProbs, Usage};
 
 const DP_RANK_METADATA: &str = "x-data-parallel-rank";
 const ENGINE_ABORT_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -348,6 +349,7 @@ impl GrpcEngineBackend {
             t_req,
             shape,
             emit_token_ids,
+            completion,
         } = prepared;
         let request = request.as_ref();
         let n_prompt_tokens = tokenized.token_ids.len();
@@ -368,12 +370,13 @@ impl GrpcEngineBackend {
         let detok_tokenizer = handle.tokenizer();
         let detok_prompt_ids = tokenized.token_ids.clone();
         let abort_request_id = handoff.engine_request_id.clone();
-        let mut proto = match chat_to_generate_request(
+        let mut proto = match chat_to_generate_request_with_options(
             request,
             tokenized.token_ids.as_ref().to_vec(),
             handoff
                 .engine_request_id
                 .unwrap_or_else(|| request_id.clone()),
+            completion.as_ref(),
         ) {
             Ok(proto) => proto,
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
@@ -464,6 +467,7 @@ impl GrpcEngineBackend {
                 .unwrap_or(false),
             shape,
             emit_token_ids,
+            completion,
             request_timeout: self.request_timeout,
             stages,
             t_req,
@@ -471,10 +475,14 @@ impl GrpcEngineBackend {
             fail_on_abort: abort_request_id.is_some(),
             abort,
         };
+        // Stage 2 keeps `n = 1` (the completions lower rejects `n > 1` and
+        // the engine rejects `num_sequences > 1`); the accumulator is
+        // index-aware so Stage 3 fan-out reuses it unchanged.
+        let n_choices = request.n.unwrap_or(1).max(1) as usize;
         if request.stream {
-            stream_openai(stream, reply, n_prompt_tokens).await
+            stream_openai(stream, reply, n_choices).await
         } else {
-            collect_openai(stream, reply).await
+            collect_openai(stream, reply, n_choices).await
         }
     }
 }
@@ -494,6 +502,8 @@ struct ChatReply {
     include_usage: bool,
     shape: ResponseShape,
     emit_token_ids: bool,
+    /// `/v1/completions` options (`echo`, `logprobs`, …); `None` for chat.
+    completion: Option<CompletionOptions>,
     request_timeout: Duration,
     stages: serde_json::Value,
     t_req: Instant,
@@ -525,10 +535,155 @@ fn fill_engine_ms(stages: &mut serde_json::Value) {
     }
 }
 
+/// One generated sequence inside one GenerateStream (`n > 1` splits by `index`).
+struct SequenceAccum {
+    text: String,
+    token_ids: Vec<u32>,
+    logprobs: LogProbs,
+    finish: Option<String>,
+    num_tokens: u32,
+    echoed: bool,
+    /// Character offset of the next output token in the client-visible text.
+    next_offset: u32,
+}
+
+impl SequenceAccum {
+    fn new(next_offset: u32) -> Self {
+        Self {
+            text: String::new(),
+            token_ids: Vec::new(),
+            logprobs: empty_logprobs(),
+            finish: None,
+            num_tokens: 0,
+            echoed: false,
+            next_offset,
+        }
+    }
+}
+
+fn empty_logprobs() -> LogProbs {
+    LogProbs {
+        tokens: Vec::new(),
+        token_logprobs: Vec::new(),
+        top_logprobs: Vec::new(),
+        text_offset: Vec::new(),
+    }
+}
+
+fn optional_values(values: &[f32]) -> Vec<Option<f32>> {
+    values.iter().map(|value| Some(*value)).collect()
+}
+
+/// OpenAI serializes `-inf` logprobs as `-9999.0`.
+fn logprob_value(value: f32) -> f32 {
+    if value.is_nan() {
+        -9999.0
+    } else {
+        value.max(-9999.0)
+    }
+}
+
+fn token_text(
+    tok: Option<&DynTokenizer>,
+    id: u32,
+    as_token_ids: bool,
+    skip_special: bool,
+) -> Result<String, String> {
+    if as_token_ids {
+        return Ok(format!("token_id:{id}"));
+    }
+    match tok {
+        Some(tokenizer) => tokenizer
+            .decode(&[id], skip_special)
+            .map_err(|error| format!("logprob detokenization failed: {error}")),
+        None => Ok(String::new()),
+    }
+}
+
+/// Append one chunk's token logprobs; returns the next character offset.
+#[allow(clippy::too_many_arguments)]
+fn append_logprobs(
+    logprobs: &mut LogProbs,
+    tok: Option<&DynTokenizer>,
+    ids: &[u32],
+    values: &[Option<f32>],
+    candidates: &[pb::CandidateTokenInfo],
+    as_token_ids: bool,
+    skip_special: bool,
+    start_offset: u32,
+) -> Result<u32, String> {
+    let mut offset = start_offset;
+    for (position, id) in ids.iter().enumerate() {
+        let token = token_text(tok, *id, as_token_ids, skip_special)?;
+        let value = values.get(position).copied().flatten().map(logprob_value);
+        let mut top = std::collections::HashMap::new();
+        if let Some(info) = candidates.get(position) {
+            for candidate in &info.tokens {
+                let text = token_text(tok, candidate.id, as_token_ids, skip_special)?;
+                top.insert(text, logprob_value(candidate.logprob));
+            }
+        }
+        if let Some(value) = value {
+            // The sampled token is part of OpenAI's top_logprobs map.
+            top.entry(token.clone()).or_insert(value);
+        }
+        logprobs.tokens.push(token.clone());
+        logprobs.token_logprobs.push(value);
+        logprobs.top_logprobs.push((!top.is_empty()).then_some(top));
+        logprobs.text_offset.push(offset);
+        offset = offset.saturating_add(token.chars().count() as u32);
+    }
+    Ok(offset)
+}
+
+fn prompt_logprobs_from_info(
+    info: &pb::PromptInfo,
+    prompt_ids: &[u32],
+    tok: Option<&DynTokenizer>,
+    as_token_ids: bool,
+    skip_special: bool,
+) -> Result<LogProbs, String> {
+    let mut logprobs = empty_logprobs();
+    if info.logprobs.is_empty() {
+        return Ok(logprobs);
+    }
+    let mut values: Vec<Option<f32>> = if info.logprobs.len() == prompt_ids.len() {
+        optional_values(&info.logprobs)
+    } else if info.logprobs.len() + 1 == prompt_ids.len() {
+        std::iter::once(None)
+            .chain(info.logprobs.iter().map(|value| Some(*value)))
+            .collect()
+    } else {
+        return Ok(logprobs);
+    };
+    // The first prompt token has no preceding token to score.
+    if let Some(first) = values.first_mut() {
+        *first = None;
+    }
+    append_logprobs(
+        &mut logprobs,
+        tok,
+        prompt_ids,
+        &values,
+        &info.candidate_tokens,
+        as_token_ids,
+        skip_special,
+        0,
+    )?;
+    Ok(logprobs)
+}
+
+fn error_frame(message: &str) -> String {
+    format!(
+        "data: {{\"error\":{}}}\n\n",
+        serde_json::to_string(message).unwrap_or_default()
+    )
+}
+
 async fn stream_openai(
     mut stream: tonic::Streaming<super::pb::GenerateResponse>,
     reply: ChatReply,
-    n_prompt_tokens: usize,
+    n_choices: usize,
 ) -> Response {
     let ChatReply {
         request_id,
@@ -541,6 +696,7 @@ async fn stream_openai(
         include_usage,
         shape,
         emit_token_ids,
+        completion,
         request_timeout,
         mut stages,
         t_req,
@@ -548,6 +704,25 @@ async fn stream_openai(
         fail_on_abort: _,
         abort,
     } = reply;
+    let echo = completion.as_ref().is_some_and(|options| options.echo);
+    let echo_text = completion
+        .as_ref()
+        .and_then(|options| options.echo_text.clone());
+    let echo_len = if echo {
+        echo_text
+            .as_deref()
+            .map(|text| text.chars().count() as u32)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let want_logprobs = completion
+        .as_ref()
+        .is_some_and(|options| options.logprobs.is_some());
+    let as_token_ids = completion
+        .as_ref()
+        .is_some_and(|options| options.return_tokens_as_token_ids);
+    let echo_only = completion.as_ref().is_some_and(|options| options.echo_only);
     let header_stages = stages.clone();
     let stages_on = crate::backend::stages_enabled();
     let (tx, rx) = mpsc::unbounded_channel::<Result<String, std::io::Error>>();
@@ -555,14 +730,18 @@ async fn stream_openai(
     let (failed_tx, failed_rx) = watch::channel(false);
     let producer = tokio::spawn(async move {
         let finished = async {
-            let mut detok = tok
-                .as_ref()
-                .map(|t| decode_stream(&**t, prompt_ids.as_ref(), skip_special));
+            let mut sequences: Vec<SequenceAccum> = (0..n_choices.max(1))
+                .map(|_| SequenceAccum::new(echo_len))
+                .collect();
+            let mut detoks: Vec<Option<Box<dyn IncrementalDecoderTrait + '_>>> = Vec::new();
+            let mut prompt_logprobs: Option<LogProbs> = None;
+            let mut prompt_tokens = prompt_ids.len() as u32;
+            let mut completion_tokens = 0u32;
             let mut first = true;
             let mut first_token_logged = false;
-            let mut prompt_tokens = n_prompt_tokens as u32;
-            let mut completion_tokens = 0u32;
-            loop {
+            let mut finished_choices = 0usize;
+            let mut all_done = false;
+            while !all_done {
                 let item = match tokio::time::timeout(request_timeout, stream.next()).await {
                     Ok(Some(item)) => item,
                     Ok(None) => break,
@@ -570,8 +749,7 @@ async fn stream_openai(
                         let _ = send_stream_chunk(
                             &tx,
                             &mut producer_output_frame,
-                            "data: {\"error\":\"gRPC stream exceeded request timeout\"}\n\n"
-                                .to_string(),
+                            error_frame("gRPC stream exceeded request timeout"),
                             false,
                         );
                         return false;
@@ -585,29 +763,57 @@ async fn stream_openai(
                         }
                         if let Some(info) = &msg.prompt_info {
                             prompt_tokens = info.num_prompt_tokens;
-                        }
-                        if let Some(outputs) = &msg.outputs {
-                            completion_tokens =
-                                completion_tokens.saturating_add(outputs.num_tokens);
-                        }
-                        let (text, finish) =
-                            match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
-                                Ok(output) => output,
-                                Err(error) => {
-                                    let _ = send_stream_chunk(
-                                        &tx,
-                                        &mut producer_output_frame,
-                                        format!(
-                                            "data: {{\"error\":{}}}\n\n",
-                                            serde_json::to_string(&error).unwrap_or_default()
-                                        ),
-                                        false,
-                                    );
-                                    return false;
+                            if prompt_logprobs.is_none() {
+                                match prompt_logprobs_from_info(
+                                    info,
+                                    &prompt_ids,
+                                    tok.as_ref(),
+                                    as_token_ids,
+                                    skip_special,
+                                ) {
+                                    Ok(value) => prompt_logprobs = Some(value),
+                                    Err(error) => {
+                                        let _ = send_stream_chunk(
+                                            &tx,
+                                            &mut producer_output_frame,
+                                            error_frame(&error),
+                                            false,
+                                        );
+                                        return false;
+                                    }
                                 }
-                            };
-                        let generated_output = has_generated_output(&msg, &text);
-                        if !first_token_logged && !text.is_empty() {
+                            }
+                        }
+                        let Some(outputs) = &msg.outputs else {
+                            continue;
+                        };
+                        let index = outputs.index as usize;
+                        if index >= sequences.len() {
+                            sequences.resize_with(index + 1, || SequenceAccum::new(echo_len));
+                        }
+                        while detoks.len() <= index {
+                            detoks.push(tok.as_ref().map(|tokenizer| {
+                                decode_stream(&**tokenizer, prompt_ids.as_ref(), skip_special)
+                            }));
+                        }
+                        let (delta, finish) = match sequence_text_and_finish(
+                            outputs,
+                            &mut detoks[index],
+                            prefer_worker_text,
+                        ) {
+                            Ok(output) => output,
+                            Err(error) => {
+                                let _ = send_stream_chunk(
+                                    &tx,
+                                    &mut producer_output_frame,
+                                    error_frame(&error),
+                                    false,
+                                );
+                                return false;
+                            }
+                        };
+                        let generated_output = has_generated_output(&msg, &delta);
+                        if !first_token_logged && !delta.is_empty() {
                             stages["first_token_ms"] =
                                 serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
                             stages["first_detok_ms"] = stages["first_token_ms"].clone();
@@ -623,31 +829,94 @@ async fn stream_openai(
                             }
                             first_token_logged = true;
                         }
-                        // Ids alone qualify: the decoder buffers byte-fallback
-                        // fragments, so text can be empty while the frame holds
-                        // tokens a token-exact client still needs.
-                        let output_token_ids = if emit_token_ids {
-                            msg.outputs
-                                .as_ref()
-                                .map(|outputs| outputs.token_ids.clone())
-                                .filter(|ids| !ids.is_empty())
+                        let sequence = &mut sequences[index];
+                        completion_tokens = completion_tokens.saturating_add(outputs.num_tokens);
+                        sequence.num_tokens =
+                            sequence.num_tokens.saturating_add(outputs.num_tokens);
+                        let mut chunk_text = delta;
+                        let mut chunk_logprobs: Option<LogProbs> = None;
+                        let echo_now = echo && !sequence.echoed;
+                        if echo_now {
+                            sequence.echoed = true;
+                            if echo_only {
+                                // `max_tokens: 0`: the prompt (when `echo` is
+                                // set) is the whole answer; the generated
+                                // token is dropped.
+                                chunk_text = echo_text.clone().unwrap_or_default();
+                            } else if let Some(text) = echo_text.as_deref() {
+                                chunk_text = format!("{text}{chunk_text}");
+                            }
+                        } else if echo_only {
+                            chunk_text.clear();
+                        }
+                        if echo_only {
+                            if echo_now {
+                                chunk_logprobs = prompt_logprobs.clone();
+                            }
+                        } else if want_logprobs {
+                            let mut logprobs = if echo_now {
+                                prompt_logprobs.clone().unwrap_or_else(empty_logprobs)
+                            } else {
+                                empty_logprobs()
+                            };
+                            let values = optional_values(&outputs.logprobs);
+                            let start = sequence.next_offset;
+                            match append_logprobs(
+                                &mut logprobs,
+                                tok.as_ref(),
+                                &outputs.token_ids,
+                                &values,
+                                &outputs.candidate_tokens,
+                                as_token_ids,
+                                skip_special,
+                                start,
+                            ) {
+                                Ok(next) => sequence.next_offset = next,
+                                Err(error) => {
+                                    let _ = send_stream_chunk(
+                                        &tx,
+                                        &mut producer_output_frame,
+                                        error_frame(&error),
+                                        false,
+                                    );
+                                    return false;
+                                }
+                            }
+                            if !logprobs.tokens.is_empty() {
+                                chunk_logprobs = Some(logprobs);
+                            }
+                        }
+                        if emit_token_ids {
+                            sequence.token_ids.extend_from_slice(&outputs.token_ids);
+                        }
+                        let chunk_ids = if echo_only {
+                            if echo_now && echo && emit_token_ids {
+                                Some(prompt_ids.to_vec())
+                            } else {
+                                None
+                            }
+                        } else if emit_token_ids && !outputs.token_ids.is_empty() {
+                            Some(outputs.token_ids.clone())
                         } else {
                             None
                         };
-                        if !text.is_empty()
-                            || output_token_ids.is_some()
+                        if !chunk_text.is_empty()
+                            || chunk_logprobs.is_some()
+                            || chunk_ids.is_some()
                             || finish.is_some()
                             || (first && shape == ResponseShape::Chat)
                         {
                             let line = sse_chunk(
                                 shape,
+                                index as u32,
                                 &request_id,
                                 &model,
                                 created,
-                                &text,
+                                &chunk_text,
                                 first,
                                 finish.clone(),
-                                output_token_ids,
+                                chunk_logprobs,
+                                chunk_ids,
                             );
                             if !send_stream_chunk(
                                 &tx,
@@ -660,48 +929,60 @@ async fn stream_openai(
                             first = false;
                         }
                         if finish.is_some() {
-                            if include_usage {
-                                let usage = Usage {
-                                    prompt_tokens,
-                                    completion_tokens,
-                                    total_tokens: prompt_tokens + completion_tokens,
-                                    completion_tokens_details: None,
-                                };
-                                let line =
-                                    sse_usage_chunk(shape, &request_id, &model, created, usage);
-                                let _ =
-                                    send_stream_chunk(&tx, &mut producer_output_frame, line, false);
+                            sequence.finish = finish;
+                            finished_choices += 1;
+                            if finished_choices >= n_choices.max(1) {
+                                if include_usage {
+                                    let usage = Usage {
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        total_tokens: prompt_tokens + completion_tokens,
+                                        completion_tokens_details: None,
+                                    };
+                                    let line =
+                                        sse_usage_chunk(shape, &request_id, &model, created, usage);
+                                    let _ = send_stream_chunk(
+                                        &tx,
+                                        &mut producer_output_frame,
+                                        line,
+                                        false,
+                                    );
+                                }
+                                let _ = send_stream_chunk(
+                                    &tx,
+                                    &mut producer_output_frame,
+                                    SSE_DONE.to_string(),
+                                    false,
+                                );
+                                all_done = true;
                             }
-                            let _ = send_stream_chunk(
-                                &tx,
-                                &mut producer_output_frame,
-                                SSE_DONE.to_string(),
-                                false,
-                            );
-                            return finish.as_deref() != Some("abort");
                         }
                     }
                     Err(status) => {
                         let _ = send_stream_chunk(
                             &tx,
                             &mut producer_output_frame,
-                            format!(
-                                "data: {{\"error\":{}}}\n\n",
-                                serde_json::to_string(status.message()).unwrap_or_default()
-                            ),
+                            error_frame(status.message()),
                             false,
                         );
                         return false;
                     }
                 }
             }
-            let _ = send_stream_chunk(
-                &tx,
-                &mut producer_output_frame,
-                "data: {\"error\":\"gRPC stream closed before finish_info\"}\n\n".to_string(),
-                false,
-            );
-            false
+            if !all_done {
+                let _ = send_stream_chunk(
+                    &tx,
+                    &mut producer_output_frame,
+                    error_frame("gRPC stream closed before finish_info"),
+                    false,
+                );
+                return false;
+            }
+            // An `abort` finish is a failed decode leg for the P/D push path:
+            // report it through the failure flag so P gets cancelled.
+            !sequences
+                .iter()
+                .any(|sequence| sequence.finish.as_deref() == Some("abort"))
         }
         .await;
         if finished {
@@ -731,6 +1012,7 @@ async fn stream_openai(
 async fn collect_openai(
     mut stream: tonic::Streaming<super::pb::GenerateResponse>,
     reply: ChatReply,
+    n_choices: usize,
 ) -> Response {
     let ChatReply {
         request_id,
@@ -743,6 +1025,7 @@ async fn collect_openai(
         include_usage: _,
         shape,
         emit_token_ids,
+        completion,
         request_timeout,
         mut stages,
         t_req,
@@ -750,12 +1033,30 @@ async fn collect_openai(
         fail_on_abort,
         abort,
     } = reply;
-    let mut detok = tok
+    let echo = completion.as_ref().is_some_and(|options| options.echo);
+    let echo_only = completion.as_ref().is_some_and(|options| options.echo_only);
+    let echo_text = completion
         .as_ref()
-        .map(|t| decode_stream(&**t, prompt_ids.as_ref(), skip_special));
-    let mut text = String::new();
-    let mut token_ids: Vec<u32> = Vec::new();
-    let mut finish = None;
+        .and_then(|options| options.echo_text.clone());
+    let echo_len = if echo {
+        echo_text
+            .as_deref()
+            .map(|text| text.chars().count() as u32)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let want_logprobs = completion
+        .as_ref()
+        .is_some_and(|options| options.logprobs.is_some());
+    let as_token_ids = completion
+        .as_ref()
+        .is_some_and(|options| options.return_tokens_as_token_ids);
+    let mut sequences: Vec<SequenceAccum> = (0..n_choices.max(1))
+        .map(|_| SequenceAccum::new(echo_len))
+        .collect();
+    let mut detoks: Vec<Option<Box<dyn IncrementalDecoderTrait + '_>>> = Vec::new();
+    let mut prompt_logprobs: Option<LogProbs> = None;
     let mut prompt_tokens = prompt_ids.len() as u32;
     let mut completion_tokens = 0u32;
     let mut first_output_seen = false;
@@ -779,9 +1080,38 @@ async fn collect_openai(
                 }
                 if let Some(info) = &msg.prompt_info {
                     prompt_tokens = info.num_prompt_tokens;
+                    if prompt_logprobs.is_none() {
+                        prompt_logprobs = Some(
+                            match prompt_logprobs_from_info(
+                                info,
+                                &prompt_ids,
+                                tok.as_ref(),
+                                as_token_ids,
+                                skip_special,
+                            ) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    return (StatusCode::BAD_GATEWAY, error).into_response();
+                                }
+                            },
+                        );
+                    }
+                }
+                let Some(outputs) = &msg.outputs else {
+                    continue;
+                };
+                let index = outputs.index as usize;
+                if index >= sequences.len() {
+                    sequences.resize_with(index + 1, || SequenceAccum::new(echo_len));
+                }
+                while detoks.len() <= index {
+                    detoks.push(tok.as_ref().map(|tokenizer| {
+                        decode_stream(&**tokenizer, prompt_ids.as_ref(), skip_special)
+                    }));
                 }
                 let (delta, reason) =
-                    match output_text_and_finish(&msg, &mut detok, prefer_worker_text) {
+                    match sequence_text_and_finish(outputs, &mut detoks[index], prefer_worker_text)
+                    {
                         Ok(output) => output,
                         Err(error) => {
                             return (StatusCode::BAD_GATEWAY, error).into_response();
@@ -799,15 +1129,34 @@ async fn collect_openai(
                     stages["first_detok_ms"] = stages["first_token_ms"].clone();
                     fill_engine_ms(&mut stages);
                 }
-                text.push_str(&delta);
-                if let Some(outputs) = &msg.outputs {
-                    completion_tokens = completion_tokens.saturating_add(outputs.num_tokens);
-                    if emit_token_ids {
-                        token_ids.extend_from_slice(&outputs.token_ids);
+                let sequence = &mut sequences[index];
+                sequence.text.push_str(&delta);
+                sequence.num_tokens = sequence.num_tokens.saturating_add(outputs.num_tokens);
+                completion_tokens = completion_tokens.saturating_add(outputs.num_tokens);
+                if emit_token_ids {
+                    sequence.token_ids.extend_from_slice(&outputs.token_ids);
+                }
+                if want_logprobs {
+                    let values = optional_values(&outputs.logprobs);
+                    let start = sequence.next_offset;
+                    match append_logprobs(
+                        &mut sequence.logprobs,
+                        tok.as_ref(),
+                        &outputs.token_ids,
+                        &values,
+                        &outputs.candidate_tokens,
+                        as_token_ids,
+                        skip_special,
+                        start,
+                    ) {
+                        Ok(next) => sequence.next_offset = next,
+                        Err(error) => {
+                            return (StatusCode::BAD_GATEWAY, error).into_response();
+                        }
                     }
                 }
                 if reason.is_some() {
-                    finish = reason;
+                    sequence.finish = reason;
                 }
             }
             Err(status) => {
@@ -819,7 +1168,7 @@ async fn collect_openai(
             }
         }
     }
-    if finish.is_none() {
+    if sequences.iter().any(|sequence| sequence.finish.is_none()) {
         return (
             StatusCode::BAD_GATEWAY,
             "gRPC stream closed before finish_info",
@@ -827,33 +1176,63 @@ async fn collect_openai(
             .into_response();
     }
     abort.disarm();
-    if fail_on_abort && finish.as_deref() == Some("abort") {
+    if fail_on_abort
+        && sequences
+            .iter()
+            .any(|sequence| sequence.finish.as_deref() == Some("abort"))
+    {
         warn!(%request_id, "gRPC decode finished aborted");
         return (StatusCode::BAD_GATEWAY, "gRPC decode finished aborted").into_response();
     }
-    let mut resp = match shape {
-        ResponseShape::Chat => axum::Json(final_response(
+    let usage = Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+        completion_tokens_details: None,
+    };
+    let mut resp = if shape == ResponseShape::Chat {
+        let sequence = &sequences[0];
+        axum::Json(final_response(
             &request_id,
             &model,
             created,
-            text,
-            finish,
+            sequence.text.clone(),
+            sequence.finish.clone(),
             prompt_tokens,
             completion_tokens,
         ))
-        .into_response(),
-        ResponseShape::Completion => axum::Json(completion_final_response(
+        .into_response()
+    } else {
+        let mut choices: Vec<CompletionChoice> = Vec::with_capacity(sequences.len());
+        for (index, sequence) in sequences.iter().enumerate() {
+            let (text, logprobs, token_ids) = completion_choice_parts(
+                sequence,
+                &prompt_ids,
+                echo_text.as_deref(),
+                echo,
+                echo_only,
+                prompt_logprobs.as_ref(),
+                emit_token_ids,
+            );
+            choices.push(CompletionChoice {
+                text,
+                index: index as u32,
+                logprobs,
+                finish_reason: sequence.finish.clone(),
+                matched_stop: None,
+                hidden_states: None,
+                prompt_token_ids: emit_token_ids.then(|| prompt_ids.to_vec()),
+                token_ids,
+            });
+        }
+        axum::Json(completion_response(
             &request_id,
             &model,
             created,
-            text,
-            finish,
-            prompt_tokens,
-            completion_tokens,
-            emit_token_ids.then_some(token_ids),
-            emit_token_ids.then(|| prompt_ids.to_vec()),
+            choices,
+            usage,
         ))
-        .into_response(),
+        .into_response()
     };
     if crate::backend::stages_enabled() {
         resp.headers_mut()
@@ -861,6 +1240,71 @@ async fn collect_openai(
         info!(%stages, "grpc generate stages");
     }
     resp
+}
+
+/// Build one choice's text, logprobs and ids, applying `echo`.
+fn completion_choice_parts(
+    sequence: &SequenceAccum,
+    prompt_ids: &[u32],
+    echo_text: Option<&str>,
+    echo: bool,
+    echo_only: bool,
+    prompt_logprobs: Option<&LogProbs>,
+    emit_token_ids: bool,
+) -> (String, Option<LogProbs>, Option<Vec<u32>>) {
+    // `max_tokens: 0` answers with the prompt only (or nothing without echo)
+    // and drops the single token the engine had to generate.
+    if echo_only {
+        return (
+            if echo {
+                echo_text.unwrap_or_default().to_string()
+            } else {
+                String::new()
+            },
+            prompt_logprobs.cloned(),
+            (echo && emit_token_ids).then(|| prompt_ids.to_vec()),
+        );
+    }
+    let (text, logprobs) = if echo {
+        let mut text = echo_text.unwrap_or_default().to_string();
+        text.push_str(&sequence.text);
+        let logprobs = match (prompt_logprobs, sequence.logprobs.tokens.is_empty()) {
+            (Some(prompt), false) => {
+                let mut merged = prompt.clone();
+                merged
+                    .tokens
+                    .extend(sequence.logprobs.tokens.iter().cloned());
+                merged
+                    .token_logprobs
+                    .extend(sequence.logprobs.token_logprobs.iter().cloned());
+                merged
+                    .top_logprobs
+                    .extend(sequence.logprobs.top_logprobs.iter().cloned());
+                merged
+                    .text_offset
+                    .extend(sequence.logprobs.text_offset.iter().cloned());
+                Some(merged)
+            }
+            (Some(prompt), true) => Some(prompt.clone()),
+            (None, false) => Some(sequence.logprobs.clone()),
+            (None, true) => None,
+        };
+        (text, logprobs)
+    } else {
+        (
+            sequence.text.clone(),
+            (!sequence.logprobs.tokens.is_empty()).then(|| sequence.logprobs.clone()),
+        )
+    };
+    let token_ids = emit_token_ids.then(|| {
+        let mut ids = Vec::new();
+        if echo {
+            ids.extend_from_slice(prompt_ids);
+        }
+        ids.extend_from_slice(&sequence.token_ids);
+        ids
+    });
+    (text, logprobs, token_ids)
 }
 
 fn notify_first_output(
@@ -877,14 +1321,11 @@ fn notify_first_output(
     }
 }
 
-fn output_text_and_finish(
-    msg: &super::pb::GenerateResponse,
+fn sequence_text_and_finish(
+    outputs: &pb::SequenceOutput,
     detok: &mut Option<Box<dyn IncrementalDecoderTrait + '_>>,
     prefer_worker_text: bool,
 ) -> Result<(String, Option<String>), String> {
-    let Some(outputs) = &msg.outputs else {
-        return Ok((String::new(), None));
-    };
     let finish = outputs
         .finish_info
         .as_ref()
@@ -996,5 +1437,140 @@ mod tests {
             true,
         ));
         assert!(consumer.on_frame());
+    }
+
+    #[test]
+    fn logprob_value_clamps_minus_inf_and_nan() {
+        assert_eq!(logprob_value(f32::NEG_INFINITY), -9999.0);
+        assert_eq!(logprob_value(f32::NAN), -9999.0);
+        assert_eq!(logprob_value(-0.5), -0.5);
+        assert_eq!(logprob_value(-20_000.0), -9999.0);
+    }
+
+    #[test]
+    fn append_logprobs_tracks_offsets_top_k_and_clamping() {
+        use crate::backend::pb::candidate_token_info::TokenInfo;
+        // `token_id:<id>` rendering needs no tokenizer, so the offsets are
+        // the character lengths of the rendered tokens.
+        let mut logprobs = empty_logprobs();
+        let candidates = vec![pb::CandidateTokenInfo {
+            tokens: vec![TokenInfo {
+                id: 9,
+                logprob: -1.5,
+                rank: 2,
+            }],
+        }];
+        let next = append_logprobs(
+            &mut logprobs,
+            None,
+            &[7, 8],
+            &[Some(-0.5), Some(f32::NEG_INFINITY)],
+            &candidates,
+            true,
+            false,
+            0,
+        )
+        .unwrap();
+        assert_eq!(logprobs.tokens, vec!["token_id:7", "token_id:8"]);
+        assert_eq!(logprobs.token_logprobs, vec![Some(-0.5), Some(-9999.0)]);
+        assert_eq!(logprobs.text_offset, vec![0, 10]);
+        assert_eq!(next, 20);
+        let top0 = logprobs.top_logprobs[0].as_ref().unwrap();
+        // The sampled token joins the candidate map.
+        assert_eq!(top0.get("token_id:9"), Some(&-1.5));
+        assert_eq!(top0.get("token_id:7"), Some(&-0.5));
+        let top1 = logprobs.top_logprobs[1].as_ref().unwrap();
+        assert_eq!(top1.get("token_id:8"), Some(&-9999.0));
+    }
+
+    #[test]
+    fn prompt_logprobs_first_position_is_null() {
+        // Engine returns one logprob per prompt token: the first has no
+        // preceding token, so OpenAI reports it as null.
+        let info = PromptInfo {
+            num_prompt_tokens: 3,
+            logprobs: vec![-0.1, -0.2, -0.3],
+            ..Default::default()
+        };
+        let logprobs = prompt_logprobs_from_info(&info, &[1, 2, 3], None, true, false).unwrap();
+        assert_eq!(logprobs.token_logprobs, vec![None, Some(-0.2), Some(-0.3)]);
+        assert_eq!(logprobs.text_offset, vec![0, 10, 20]);
+
+        // Engine returns one fewer (no entry for the first token): same
+        // result, the null is prepended.
+        let info = PromptInfo {
+            num_prompt_tokens: 3,
+            logprobs: vec![-0.2, -0.3],
+            ..Default::default()
+        };
+        let logprobs = prompt_logprobs_from_info(&info, &[1, 2, 3], None, true, false).unwrap();
+        assert_eq!(logprobs.token_logprobs, vec![None, Some(-0.2), Some(-0.3)]);
+
+        // A length that matches neither shape is dropped, not misaligned.
+        let info = PromptInfo {
+            num_prompt_tokens: 3,
+            logprobs: vec![-0.1],
+            ..Default::default()
+        };
+        let logprobs = prompt_logprobs_from_info(&info, &[1, 2, 3], None, true, false).unwrap();
+        assert!(logprobs.tokens.is_empty());
+    }
+
+    #[test]
+    fn completion_choice_parts_merges_echo_and_drops_the_echo_only_token() {
+        let prompt_logprobs = LogProbs {
+            tokens: vec!["token_id:1".to_string()],
+            token_logprobs: vec![None],
+            top_logprobs: vec![None],
+            text_offset: vec![0],
+        };
+        let mut sequence = SequenceAccum::new(2);
+        sequence.text = " world".to_string();
+        sequence.token_ids = vec![8];
+        sequence.logprobs.tokens = vec!["token_id:8".to_string()];
+        sequence.logprobs.token_logprobs = vec![Some(-0.5)];
+        sequence.logprobs.top_logprobs = vec![None];
+        sequence.logprobs.text_offset = vec![2];
+
+        // Echo: prompt text and prompt logprobs come first.
+        let (text, logprobs, token_ids) = completion_choice_parts(
+            &sequence,
+            &[1, 2],
+            Some("hi"),
+            true,
+            false,
+            Some(&prompt_logprobs),
+            true,
+        );
+        assert_eq!(text, "hi world");
+        let logprobs = logprobs.unwrap();
+        assert_eq!(logprobs.tokens, vec!["token_id:1", "token_id:8"]);
+        assert_eq!(logprobs.token_logprobs, vec![None, Some(-0.5)]);
+        assert_eq!(logprobs.text_offset, vec![0, 2]);
+        assert_eq!(token_ids, Some(vec![1, 2, 8]));
+
+        // Echo-only (`max_tokens: 0`): the prompt is the whole answer.
+        let (text, logprobs, token_ids) = completion_choice_parts(
+            &sequence,
+            &[1, 2],
+            Some("hi"),
+            true,
+            true,
+            Some(&prompt_logprobs),
+            true,
+        );
+        assert_eq!(text, "hi");
+        let logprobs = logprobs.unwrap();
+        assert_eq!(logprobs.tokens, prompt_logprobs.tokens);
+        assert_eq!(logprobs.token_logprobs, prompt_logprobs.token_logprobs);
+        assert_eq!(logprobs.text_offset, prompt_logprobs.text_offset);
+        assert_eq!(token_ids, Some(vec![1, 2]));
+
+        // No echo: output only.
+        let (text, logprobs, token_ids) =
+            completion_choice_parts(&sequence, &[1, 2], None, false, false, None, false);
+        assert_eq!(text, " world");
+        assert_eq!(logprobs.unwrap().tokens, vec!["token_id:8"]);
+        assert_eq!(token_ids, None);
     }
 }
