@@ -241,19 +241,25 @@ impl EngineFrontend {
                     "completion prompt produced no token ids".to_string(),
                 ));
             }
+            let pre_truncate_len = tokenized.token_ids.len();
             truncate_grpc_prompt(chat.as_ref(), &mut tokenized)?;
-            // Text prompts already carry the client string; id prompts get
-            // their echo text decoded here, after truncation, so the reply
-            // echoes exactly the ids that were dispatched.
+            // Text prompts already carry the client string, which is exact
+            // — unless truncation cut dispatched ids. Truncation keeps the
+            // suffix, so a pre-truncation string would echo tokens that were
+            // never dispatched, and echo text, text_offset and prompt
+            // logprobs would disagree. Decode from the truncated ids then,
+            // like id prompts do; fall back to the client string when there
+            // is no tokenizer to decode with.
             let echo_text = if options.echo {
                 match echo_text {
-                    Some(text) => Some(text),
-                    None => decode_completion_text(
+                    Some(text) if tokenized.token_ids.len() == pre_truncate_len => Some(text),
+                    other => decode_completion_text(
                         &handle,
                         &tokenized.token_ids,
                         chat.skip_special_tokens,
                     )
-                    .map_err(|error| PrepareError::Unavailable(error.to_string()))?,
+                    .map_err(|error| PrepareError::Unavailable(error.to_string()))?
+                    .or(other),
                 }
             } else {
                 None

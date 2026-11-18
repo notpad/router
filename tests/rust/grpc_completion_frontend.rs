@@ -541,6 +541,97 @@ async fn grpc_completion_logprobs_echo_streams_per_chunk() {
 }
 
 #[tokio::test]
+async fn grpc_completion_echo_with_truncated_text_prompt_stays_aligned() {
+    use axum::body::to_bytes;
+    use common::mock_vllm_rs::{FrameLogprobs, MockVllmRs};
+    use vllm_router_rs::config::{PolicyConfig, RouterConfig};
+    use vllm_router_rs::routers::http::router::Router;
+
+    let state = MockVllmRs {
+        frame_logprobs: Some(vec![FrameLogprobs {
+            logprobs: vec![-0.5, -0.6, -0.7],
+            ranks: vec![1, 1, 1],
+            candidates: vec![],
+        }]),
+        emit_prompt_logprobs: true,
+        ..Default::default()
+    };
+    let model = fixture::model_fixture();
+    let worker = common::mock_vllm_rs::MockVllmRsServer::spawn_with_state(state).await;
+    let config = RouterConfig {
+        policy: PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        },
+        disable_circuit_breaker: true,
+        ..Default::default()
+    };
+    let context = common::create_test_context(config);
+    let router = Router::new(vec![worker.grpc_url.clone()], &context)
+        .await
+        .unwrap();
+
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": "a longer text to truncate",
+        "truncate_prompt_tokens": 6,
+        "logprobs": 2,
+        "echo": true,
+    }))
+    .unwrap();
+    // The frontend's echo text is decoded from the truncated ids, not the
+    // client's full string.
+    let frontend = EngineFrontend::new();
+    let prepared = frontend.prepare_completions(&request).await.unwrap();
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].tokenized.token_ids.len(), 6);
+    let echo_text = prepared[0]
+        .completion
+        .as_ref()
+        .and_then(|options| options.echo_text.clone())
+        .unwrap();
+    assert_ne!(echo_text, "a longer text to truncate");
+
+    let response = router
+        .route_typed_request(None, &request, "/v1/completions", None)
+        .await;
+    assert!(response.status().is_success());
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let choice = &json["choices"][0];
+    // The reply echoes the truncated text, then the generated text (the
+    // router decodes the mock's [7, 8, 9] itself; the mock's reply_text is
+    // not used on this path).
+    let text = choice["text"].as_str().unwrap();
+    assert!(text.starts_with(&echo_text), "{text} vs {echo_text}");
+    assert!(text.len() > echo_text.len());
+    // Prompt logprobs cover exactly the 6 dispatched ids, then the 3
+    // output entries; the first output token starts where the echoed text
+    // ends.
+    let logprobs = &choice["logprobs"];
+    let tokens = logprobs["tokens"].as_array().unwrap();
+    let token_logprobs = logprobs["token_logprobs"].as_array().unwrap();
+    let text_offset = logprobs["text_offset"].as_array().unwrap();
+    assert_eq!(tokens.len(), 9);
+    assert_eq!(token_logprobs.len(), 9);
+    assert_eq!(text_offset.len(), 9);
+    assert!(token_logprobs[0].is_null());
+    assert!(token_logprobs[1..6]
+        .iter()
+        .all(|value| *value == json!(-0.1)));
+    assert_eq!(
+        &token_logprobs[6..],
+        &[json!(-0.5), json!(-0.6), json!(-0.7)]
+    );
+    assert_eq!(text_offset[6], echo_text.chars().count() as u64);
+    // The worker received exactly the truncated ids.
+    assert_eq!(worker.captured().last().unwrap().token_ids.len(), 6);
+}
+
+#[tokio::test]
 async fn grpc_completion_text_prompt_bos_default_end_to_end() {
     use axum::body::to_bytes;
     use vllm_router_rs::config::{PolicyConfig, RouterConfig};
