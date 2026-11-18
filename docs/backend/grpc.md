@@ -22,7 +22,7 @@ Support status of the OpenAI HTTP surface when the worker pool is `grpc://`:
 | API | Status | Behavior |
 |---|---|---|
 | `/v1/chat/completions` | Supported | The router renders the chat template and tokenizes, then sends `TokenIds`. |
-| `/v1/completions` | Supported, single prompt | `prompt` may be `str`, `list[str]`, `list[int]`, or `list[list[int]]`; a text prompt is tokenized once with the model tokenizer (`add_special_tokens` defaults to `true`) and ids go straight to the wire. Batched prompts and fields the chat shape cannot express (`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`, `return_hidden_states`, `documents`) are rejected with `400`. |
+| `/v1/completions` | Supported, single prompt | `prompt` may be `str`, `list[str]`, `list[int]`, or `list[list[int]]`; a text prompt is tokenized once with the model tokenizer (`add_special_tokens` defaults to `true`) and ids go straight to the wire. `logprobs` (0–20), `prompt_logprobs`, `logprob_token_ids`, `echo`, and `echo` + `max_tokens: 0` are served on the regular gRPC pool. Batched prompts and fields the chat shape cannot express (`suffix`, `best_of`, `n > 1`, `json_schema`, `return_hidden_states`, `documents`) are rejected with `400`. |
 | `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/generate`, `/inference/v1/generate` | Not supported | Rejected with `400` before dispatch, so they are client errors and never reach a worker. |
 | `/v1/models`, `/health` | Supported | Answered through the gRPC control/health services. |
 | `/health_generate` | Not supported | Returns `501`; use `/health` for gRPC readiness. |
@@ -55,7 +55,18 @@ text is empty. The non-streaming choice also carries `prompt_token_ids` (the
 client's ids) under the same flag; streaming never echoes prompt ids, matching
 vLLM HTTP where that happens only under `echo`.
 
-`suffix`, `best_of`, `n > 1`, `json_schema`, `logprobs`, `echo`,
+`logprobs` maps onto the proto `ResponseOptions` (`output_logprobs` plus a
+top-N or `logprob_token_ids` candidate selection; `prompt_logprobs`, explicit
+or implied by `echo` + `logprobs`, onto `prompt_logprobs` + candidates), and
+the reply rebuilds OpenAI `logprobs` per sequence (`tokens`,
+`token_logprobs`, `top_logprobs`, `text_offset`, `-inf` clamped to `-9999`,
+first prompt position `null`). `echo` prefixes the prompt text and shifts
+`text_offset`; `echo` + `max_tokens: 0` answers with the prompt only, the one
+token the engine had to generate being dropped. Logprobs and echo live on
+the regular-pool path only: the gRPC P/D route still rejects them with 400,
+since its response path has no per-sequence accumulator.
+
+`suffix`, `best_of`, `n > 1`, `json_schema`,
 `return_hidden_states`, `documents`, negative prompt ids, and unknown
 passthrough keys return 400 instead of being dropped.
 
