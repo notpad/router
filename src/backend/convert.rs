@@ -83,6 +83,8 @@ pub struct CompletionOptions {
     /// `prompt_logprobs` from vLLM extensions; echo implies it when `logprobs`
     /// is set, matching the HTTP frontend.
     pub prompt_logprobs: Option<u32>,
+    /// `prompt_logprobs: -1`: every prompt position returns all candidates.
+    pub prompt_logprobs_all: bool,
     /// `echo` with `max_tokens == 0`: answer with the prompt only, so the
     /// engine still has to produce one token (the HTTP frontend does the same).
     pub echo_only: bool,
@@ -238,7 +240,13 @@ pub fn chat_to_generate_request_with_options(
                     .or_else(|| options.logprobs.and_then(top_n_candidates))
             }),
             prompt_logprobs: prompt_logprobs.is_some(),
-            prompt_candidates: prompt_logprobs.and_then(top_n_candidates),
+            prompt_candidates: if completion.is_some_and(|options| options.prompt_logprobs_all) {
+                Some(pb::CandidateTokens {
+                    select: Some(pb::candidate_tokens::Select::All(true)),
+                })
+            } else {
+                prompt_logprobs.and_then(top_n_candidates)
+            },
             ..Default::default()
         }),
         kv: Some(pb::KvCacheParameters {
@@ -640,8 +648,11 @@ pub fn prepare_grpc_completion_prompts(
             Some(ids)
         }
     };
-    // `-1` asks vLLM for every prompt position; the gRPC bool has no count to
-    // carry, so it maps to "on, no candidate tokens".
+    // `-1` asks vLLM for every prompt position: all candidates per token.
+    let prompt_logprobs_all = request
+        .other
+        .get(PROMPT_LOGPROBS)
+        .is_some_and(|value| value.as_i64() == Some(-1));
     let prompt_logprobs = match request.other.get(PROMPT_LOGPROBS) {
         None => None,
         Some(value) => Some(
@@ -737,6 +748,7 @@ pub fn prepare_grpc_completion_prompts(
             echo: request.echo,
             logprobs: request.logprobs,
             prompt_logprobs,
+            prompt_logprobs_all,
             echo_only: request.echo && request.max_tokens == Some(0),
             return_tokens_as_token_ids,
             logprob_token_ids,
@@ -1247,13 +1259,14 @@ mod tests {
             Some(pb::candidate_tokens::Select::TopN(3))
         ));
 
-        // Explicit `prompt_logprobs: -1` asks for every prompt position;
-        // the bool has no count to carry, so no candidate tokens.
+        // Explicit `prompt_logprobs: -1` asks for every prompt position:
+        // all candidates per token.
         let lowered = prepare_grpc_completion_prompts(&completion(serde_json::json!({
             "prompt": [1, 2], "prompt_logprobs": -1
         })))
         .unwrap();
         assert_eq!(lowered.options.prompt_logprobs, Some(0));
+        assert!(lowered.options.prompt_logprobs_all);
         let proto = chat_to_generate_request_with_options(
             &lowered.chat,
             vec![1, 2],
@@ -1263,7 +1276,10 @@ mod tests {
         .unwrap();
         let response = proto.response.unwrap();
         assert!(response.prompt_logprobs);
-        assert!(response.prompt_candidates.is_none());
+        assert!(matches!(
+            response.prompt_candidates.and_then(|c| c.select),
+            Some(pb::candidate_tokens::Select::All(true))
+        ));
         assert!(!response.output_logprobs);
 
         // `logprob_token_ids` selects ids instead of top-N for the output.

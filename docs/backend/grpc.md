@@ -57,7 +57,8 @@ vLLM HTTP where that happens only under `echo`.
 
 `logprobs` maps onto the proto `ResponseOptions` (`output_logprobs` plus a
 top-N or `logprob_token_ids` candidate selection; `prompt_logprobs`, explicit
-or implied by `echo` + `logprobs`, onto `prompt_logprobs` + candidates), and
+or implied by `echo` + `logprobs`, onto `prompt_logprobs` + candidates, with
+`-1` selecting all candidates per prompt position), and
 the reply rebuilds OpenAI `logprobs` per sequence (`tokens`,
 `token_logprobs`, `top_logprobs`, `text_offset`, `-inf` clamped to `-9999`,
 first prompt position `null`). Streaming with an explicit
