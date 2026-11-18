@@ -654,6 +654,13 @@ pub fn prepare_grpc_completion_prompts(
                 })?,
         ),
     };
+    // vLLM rejects streaming explicit `prompt_logprobs`, and with no
+    // `logprobs` the streaming path would silently drop them: chunk
+    // logprobs are only built when output logprobs were requested.
+    // Non-streaming keeps the merge.
+    if request.stream && prompt_logprobs.is_some() && request.logprobs.is_none() {
+        return Err("streaming prompt_logprobs requires logprobs".to_string());
+    }
     if let Some(top_n) = request.logprobs {
         if top_n > 20 {
             return Err("logprobs must be between 0 and 20".to_string());
@@ -1327,6 +1334,29 @@ mod tests {
         })))
         .unwrap_err();
         assert!(bad_type.contains("array"), "{bad_type}");
+
+        // Streaming explicit `prompt_logprobs` without `logprobs` is
+        // rejected: the streaming path would silently drop them.
+        let streaming_prompt_logprobs =
+            prepare_grpc_completion_prompts(&completion(serde_json::json!({
+                "prompt": [1], "prompt_logprobs": 2, "stream": true
+            })))
+            .unwrap_err();
+        assert!(
+            streaming_prompt_logprobs.contains("streaming prompt_logprobs"),
+            "{streaming_prompt_logprobs}"
+        );
+
+        // The same request is fine non-streaming, and streaming with
+        // `logprobs` set keeps the prompt-logprobs merge.
+        prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1], "prompt_logprobs": 2
+        })))
+        .unwrap();
+        prepare_grpc_completion_prompts(&completion(serde_json::json!({
+            "prompt": [1], "prompt_logprobs": 2, "logprobs": 2, "stream": true
+        })))
+        .unwrap();
     }
 
     #[test]
