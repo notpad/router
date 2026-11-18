@@ -611,6 +611,7 @@ fn append_logprobs(
     candidates: &[pb::CandidateTokenInfo],
     as_token_ids: bool,
     skip_special: bool,
+    selected_ids: Option<&[u32]>,
     start_offset: u32,
 ) -> Result<u32, String> {
     let mut offset = start_offset;
@@ -625,8 +626,12 @@ fn append_logprobs(
             }
         }
         if let Some(value) = value {
-            // The sampled token is part of OpenAI's top_logprobs map.
-            top.entry(token.clone()).or_insert(value);
+            // The sampled token joins OpenAI's top_logprobs map — except
+            // under a TokenIds selection, which reports logprobs only for
+            // the requested ids.
+            if selected_ids.map_or(true, |ids| ids.contains(id)) {
+                top.entry(token.clone()).or_insert(value);
+            }
         }
         logprobs.tokens.push(token.clone());
         logprobs.token_logprobs.push(value);
@@ -643,6 +648,7 @@ fn prompt_logprobs_from_info(
     tok: Option<&DynTokenizer>,
     as_token_ids: bool,
     skip_special: bool,
+    selected_ids: Option<&[u32]>,
 ) -> Result<LogProbs, String> {
     let mut logprobs = empty_logprobs();
     if info.logprobs.is_empty() {
@@ -669,6 +675,7 @@ fn prompt_logprobs_from_info(
         &info.candidate_tokens,
         as_token_ids,
         skip_special,
+        selected_ids,
         0,
     )?;
     Ok(logprobs)
@@ -731,6 +738,9 @@ async fn stream_openai(
         .as_ref()
         .and_then(completion_prompt_logprobs)
         .is_some();
+    let logprob_token_ids = completion
+        .as_ref()
+        .and_then(|options| options.logprob_token_ids.clone());
     let header_stages = stages.clone();
     let stages_on = crate::backend::stages_enabled();
     let (tx, rx) = mpsc::unbounded_channel::<Result<String, std::io::Error>>();
@@ -781,6 +791,7 @@ async fn stream_openai(
                                     tok.as_ref(),
                                     as_token_ids,
                                     skip_special,
+                                    logprob_token_ids.as_deref(),
                                 ) {
                                     Ok(value) => prompt_logprobs = Some(value),
                                     Err(error) => {
@@ -892,6 +903,7 @@ async fn stream_openai(
                                 &outputs.candidate_tokens,
                                 as_token_ids,
                                 skip_special,
+                                logprob_token_ids.as_deref(),
                                 start,
                             ) {
                                 Ok(next) => sequence.next_offset = next,
@@ -1118,6 +1130,9 @@ async fn collect_openai(
                                 tok.as_ref(),
                                 as_token_ids,
                                 skip_special,
+                                completion
+                                    .as_ref()
+                                    .and_then(|options| options.logprob_token_ids.as_deref()),
                             ) {
                                 Ok(value) => value,
                                 Err(error) => {
@@ -1177,6 +1192,9 @@ async fn collect_openai(
                         &outputs.candidate_tokens,
                         as_token_ids,
                         skip_special,
+                        completion
+                            .as_ref()
+                            .and_then(|options| options.logprob_token_ids.as_deref()),
                         start,
                     ) {
                         Ok(next) => sequence.next_offset = next,
@@ -1498,6 +1516,7 @@ mod tests {
             &candidates,
             true,
             false,
+            None,
             0,
         )
         .unwrap();
@@ -1514,6 +1533,55 @@ mod tests {
     }
 
     #[test]
+    fn append_logprobs_restricts_sampled_token_to_selected_ids() {
+        use crate::backend::pb::candidate_token_info::TokenInfo;
+        // TokenIds selection: the sampled token joins the top map only
+        // when it is one of the requested ids; its scalar logprob is
+        // still reported.
+        let candidates = vec![pb::CandidateTokenInfo {
+            tokens: vec![TokenInfo {
+                id: 9,
+                logprob: -1.5,
+                rank: 2,
+            }],
+        }];
+        let mut logprobs = empty_logprobs();
+        append_logprobs(
+            &mut logprobs,
+            None,
+            &[7],
+            &[Some(-0.5)],
+            &candidates,
+            true,
+            false,
+            Some(&[9]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(logprobs.token_logprobs, vec![Some(-0.5)]);
+        let top0 = logprobs.top_logprobs[0].as_ref().unwrap();
+        assert_eq!(top0.get("token_id:9"), Some(&-1.5));
+        assert_eq!(top0.get("token_id:7"), None);
+
+        let mut logprobs = empty_logprobs();
+        append_logprobs(
+            &mut logprobs,
+            None,
+            &[7],
+            &[Some(-0.5)],
+            &candidates,
+            true,
+            false,
+            Some(&[7, 9]),
+            0,
+        )
+        .unwrap();
+        let top0 = logprobs.top_logprobs[0].as_ref().unwrap();
+        assert_eq!(top0.get("token_id:7"), Some(&-0.5));
+        assert_eq!(top0.get("token_id:9"), Some(&-1.5));
+    }
+
+    #[test]
     fn prompt_logprobs_first_position_is_null() {
         // Engine returns one logprob per prompt token: the first has no
         // preceding token, so OpenAI reports it as null.
@@ -1522,7 +1590,8 @@ mod tests {
             logprobs: vec![-0.1, -0.2, -0.3],
             ..Default::default()
         };
-        let logprobs = prompt_logprobs_from_info(&info, &[1, 2, 3], None, true, false).unwrap();
+        let logprobs =
+            prompt_logprobs_from_info(&info, &[1, 2, 3], None, true, false, None).unwrap();
         assert_eq!(logprobs.token_logprobs, vec![None, Some(-0.2), Some(-0.3)]);
         assert_eq!(logprobs.text_offset, vec![0, 10, 20]);
 
@@ -1533,7 +1602,8 @@ mod tests {
             logprobs: vec![-0.2, -0.3],
             ..Default::default()
         };
-        let logprobs = prompt_logprobs_from_info(&info, &[1, 2, 3], None, true, false).unwrap();
+        let logprobs =
+            prompt_logprobs_from_info(&info, &[1, 2, 3], None, true, false, None).unwrap();
         assert_eq!(logprobs.token_logprobs, vec![None, Some(-0.2), Some(-0.3)]);
 
         // A length that matches neither shape is dropped, not misaligned.
@@ -1542,7 +1612,8 @@ mod tests {
             logprobs: vec![-0.1],
             ..Default::default()
         };
-        let logprobs = prompt_logprobs_from_info(&info, &[1, 2, 3], None, true, false).unwrap();
+        let logprobs =
+            prompt_logprobs_from_info(&info, &[1, 2, 3], None, true, false, None).unwrap();
         assert!(logprobs.tokens.is_empty());
     }
 
