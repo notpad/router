@@ -756,6 +756,13 @@ async fn stream_openai(
             // Prompt logprobs merge into the first chunk that carries output
             // logprobs, once they have arrived.
             let mut prompt_logprobs_sent = false;
+            // Once a chunk carrying output logprobs has gone out, prompt
+            // logprobs arriving later can no longer be merged in front:
+            // they would land after the output entries with non-monotonic
+            // offsets. They are dropped (with a warning) instead. The
+            // proto documents `prompt_info` as present only in the first
+            // response, so this only fires for a non-conforming engine.
+            let mut sent_output_logprobs = false;
             let mut prompt_tokens = prompt_ids.len() as u32;
             let mut completion_tokens = 0u32;
             let mut first = true;
@@ -785,23 +792,27 @@ async fn stream_openai(
                         if let Some(info) = &msg.prompt_info {
                             prompt_tokens = info.num_prompt_tokens;
                             if want_prompt_logprobs && prompt_logprobs.is_none() {
-                                match prompt_logprobs_from_info(
-                                    info,
-                                    &prompt_ids,
-                                    tok.as_ref(),
-                                    as_token_ids,
-                                    skip_special,
-                                    logprob_token_ids.as_deref(),
-                                ) {
-                                    Ok(value) => prompt_logprobs = Some(value),
-                                    Err(error) => {
-                                        let _ = send_stream_chunk(
-                                            &tx,
-                                            &mut producer_output_frame,
-                                            error_frame(&error),
-                                            false,
-                                        );
-                                        return false;
+                                if sent_output_logprobs {
+                                    warn!(%request_id, "dropping late streaming prompt logprobs: a chunk with output logprobs was already sent");
+                                } else {
+                                    match prompt_logprobs_from_info(
+                                        info,
+                                        &prompt_ids,
+                                        tok.as_ref(),
+                                        as_token_ids,
+                                        skip_special,
+                                        logprob_token_ids.as_deref(),
+                                    ) {
+                                        Ok(value) => prompt_logprobs = Some(value),
+                                        Err(error) => {
+                                            let _ = send_stream_chunk(
+                                                &tx,
+                                                &mut producer_output_frame,
+                                                error_frame(&error),
+                                                false,
+                                            );
+                                            return false;
+                                        }
                                     }
                                 }
                             }
@@ -857,6 +868,7 @@ async fn stream_openai(
                             sequence.num_tokens.saturating_add(outputs.num_tokens);
                         let mut chunk_text = delta;
                         let mut chunk_logprobs: Option<LogProbs> = None;
+                        let mut chunk_has_output_logprobs = false;
                         let echo_now = echo && !sequence.echoed;
                         if echo_now {
                             sequence.echoed = true;
@@ -877,11 +889,11 @@ async fn stream_openai(
                             }
                         } else if want_logprobs {
                             // Prompt logprobs merge into the first chunk
-                            // that carries output logprobs. PromptInfo is
-                            // documented to arrive in the first response,
-                            // but an engine may send it later; holding the
-                            // merge until it arrives keeps the prompt
-                            // entries instead of losing them.
+                            // that carries output logprobs, if they arrived
+                            // before any output chunk went out; a later
+                            // PromptInfo is dropped at the prompt-info
+                            // handler instead of landing after the output
+                            // entries.
                             let mut logprobs = if !prompt_logprobs_sent {
                                 match &prompt_logprobs {
                                     Some(prompt) => {
@@ -895,6 +907,7 @@ async fn stream_openai(
                             };
                             let values = optional_values(&outputs.logprobs);
                             let start = sequence.next_offset;
+                            let tokens_before = logprobs.tokens.len();
                             match append_logprobs(
                                 &mut logprobs,
                                 tok.as_ref(),
@@ -906,7 +919,11 @@ async fn stream_openai(
                                 logprob_token_ids.as_deref(),
                                 start,
                             ) {
-                                Ok(next) => sequence.next_offset = next,
+                                Ok(next) => {
+                                    sequence.next_offset = next;
+                                    chunk_has_output_logprobs =
+                                        logprobs.tokens.len() > tokens_before;
+                                }
                                 Err(error) => {
                                     let _ = send_stream_chunk(
                                         &tx,
@@ -960,6 +977,9 @@ async fn stream_openai(
                                 generated_output,
                             ) {
                                 break;
+                            }
+                            if chunk_has_output_logprobs {
+                                sent_output_logprobs = true;
                             }
                             first = false;
                         }

@@ -582,6 +582,26 @@ async fn grpc_completion_logprobs_echo_streams_per_chunk() {
         "{first}"
     );
     assert!(first["logprobs"]["token_logprobs"][0].is_null());
+    // Prompt entries precede output entries in the first chunk: the
+    // frame's output logprobs (-0.5, -0.6) come last.
+    let first_logprobs = first["logprobs"]["token_logprobs"].as_array().unwrap();
+    assert_eq!(first_logprobs[first_logprobs.len() - 2], json!(-0.5));
+    assert_eq!(first_logprobs[first_logprobs.len() - 1], json!(-0.6));
+    // text_offset is monotonic across chunks.
+    let offsets: Vec<u64> = chunks
+        .iter()
+        .flat_map(|chunk| {
+            chunk["choices"][0]["logprobs"]["text_offset"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .map(|value| value.as_u64().unwrap())
+        .collect();
+    assert!(
+        offsets.windows(2).all(|pair| pair[1] >= pair[0]),
+        "{offsets:?}"
+    );
     // A later chunk carries the first output token's logprob.
     assert!(chunks.iter().any(|chunk| {
         chunk["choices"][0]["logprobs"]["token_logprobs"]
@@ -591,14 +611,17 @@ async fn grpc_completion_logprobs_echo_streams_per_chunk() {
 }
 
 #[tokio::test]
-async fn grpc_completion_late_prompt_info_streams_in_a_later_chunk() {
+async fn grpc_completion_late_prompt_info_is_dropped_not_merged() {
     use axum::body::to_bytes;
     use common::mock_vllm_rs::{FrameLogprobs, MockVllmRs};
     use vllm_router_rs::config::{PolicyConfig, RouterConfig};
     use vllm_router_rs::routers::http::router::Router;
 
     // PromptInfo arrives after the first output frame, as a
-    // non-conforming engine might send it.
+    // non-conforming engine might send it. The prompt logprobs are
+    // dropped instead of merged into a later chunk: merging them
+    // there would put prompt entries after output entries with
+    // non-monotonic offsets.
     let state = MockVllmRs {
         frames: Some(vec![
             ("".to_string(), vec![7, 8]),
@@ -668,24 +691,46 @@ async fn grpc_completion_late_prompt_info_streams_in_a_later_chunk() {
         json!([-0.5, -0.6]),
         "{first}"
     );
-    // A later chunk merges the prompt logprobs in front of its output
-    // logprobs (first prompt position null, rest -0.1) instead of
-    // losing them.
-    let merged = chunks
+    // No chunk carries a prompt entry (first prompt position null):
+    // the late prompt logprobs were dropped, not merged into a later
+    // chunk. The second chunk carries only the second frame's output
+    // logprob.
+    assert!(
+        !chunks.iter().any(|chunk| {
+            chunk["choices"][0]["logprobs"]["token_logprobs"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value.is_null()))
+        }),
+        "{text}"
+    );
+    let second = chunks
         .iter()
         .find(|chunk| {
             chunk["choices"][0]["logprobs"]["token_logprobs"]
                 .as_array()
-                .is_some_and(|values| values.first().is_some_and(|value| value.is_null()))
+                .is_some_and(|values| values.iter().any(|value| *value == json!(-0.7)))
         })
-        .expect("prompt logprobs merged into a later chunk");
-    let values = merged["choices"][0]["logprobs"]["token_logprobs"]
-        .as_array()
-        .unwrap();
-    assert_eq!(values[values.len() - 1], json!(-0.7));
-    assert!(values[1..values.len() - 1]
+        .expect("second frame's output logprob present");
+    assert_eq!(
+        second["choices"][0]["logprobs"]["token_logprobs"],
+        json!([-0.7]),
+        "{second}"
+    );
+    // text_offset stays monotonic across chunks.
+    let offsets: Vec<u64> = chunks
         .iter()
-        .all(|value| *value == json!(-0.1)));
+        .flat_map(|chunk| {
+            chunk["choices"][0]["logprobs"]["text_offset"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .map(|value| value.as_u64().unwrap())
+        .collect();
+    assert!(
+        offsets.windows(2).all(|pair| pair[1] >= pair[0]),
+        "{offsets:?}"
+    );
 }
 
 #[tokio::test]
