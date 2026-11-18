@@ -24,7 +24,8 @@ use vllm_router_rs::backend::pb::{
     control_server::{Control, ControlServer},
     finish_info, generate_request,
     inference_server::{Inference, InferenceServer},
-    FinishInfo, GenerateRequest, GenerateResponse, PromptInfo, SequenceOutput, TokenIds,
+    CandidateTokenInfo, FinishInfo, GenerateRequest, GenerateResponse, PromptInfo, ResponseOptions,
+    SequenceOutput, TokenIds,
 };
 
 #[derive(Clone, Default)]
@@ -42,6 +43,16 @@ pub struct CapturedGrpcGenerate {
     /// `x-data-parallel-rank` request metadata.
     pub dp_rank: Option<String>,
     pub received_at: Option<Instant>,
+    /// `GenerateRequest.response` as received.
+    pub response_options: Option<ResponseOptions>,
+}
+
+/// Per-position logprobs for one streamed frame (or the prompt info).
+#[derive(Clone, Default)]
+pub struct FrameLogprobs {
+    pub logprobs: Vec<f32>,
+    pub ranks: Vec<u32>,
+    pub candidates: Vec<CandidateTokenInfo>,
 }
 
 #[derive(Clone)]
@@ -52,6 +63,10 @@ pub struct MockVllmRs {
     /// `finish_info`. `None` sends a single frame: `reply_text` + `[7, 8, 9]`.
     /// Empty text with non-empty ids reproduces a buffered decoder fragment.
     pub frames: Option<Vec<(String, Vec<u32>)>>,
+    /// Per-frame logprobs/ranks/candidates, aligned with `frames` by index.
+    pub frame_logprobs: Option<Vec<FrameLogprobs>>,
+    /// Emit one `-0.1` prompt logprob per prompt token in `PromptInfo`.
+    pub emit_prompt_logprobs: bool,
     pub capture_limit: usize,
     pub failures_remaining: Arc<AtomicUsize>,
     /// Returned in `FinishInfo.kv_transfer_params`, as a P/D prefill engine does.
@@ -122,6 +137,8 @@ impl Default for MockVllmRs {
             captured: Arc::new(Mutex::new(Vec::new())),
             reply_text: "hello from worker".to_string(),
             frames: None,
+            frame_logprobs: None,
+            emit_prompt_logprobs: false,
             capture_limit: usize::MAX,
             failures_remaining: Arc::new(AtomicUsize::new(0)),
             finish_kv_transfer_params: None,
@@ -266,6 +283,7 @@ impl Inference for MockVllmRs {
                     unary: false,
                     dp_rank,
                     received_at: Some(Instant::now()),
+                    response_options: req.response.clone(),
                 });
             }
         }
@@ -293,6 +311,8 @@ impl Inference for MockVllmRs {
             .map(|params| json_to_proto_struct(params).expect("JSON object"));
         let reply_delay = self.reply_delay;
         let cancelled = self.cancelled.clone();
+        let frame_logprobs = self.frame_logprobs.clone();
+        let emit_prompt_logprobs = self.emit_prompt_logprobs;
         let fail_stream = self
             .stream_failures_remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
@@ -318,6 +338,16 @@ impl Inference for MockVllmRs {
                 .send(Ok(GenerateResponse {
                     prompt_info: Some(PromptInfo {
                         num_prompt_tokens: n_prompt,
+                        logprobs: if emit_prompt_logprobs {
+                            vec![-0.1; n_prompt as usize]
+                        } else {
+                            Vec::new()
+                        },
+                        ranks: if emit_prompt_logprobs {
+                            vec![1; n_prompt as usize]
+                        } else {
+                            Vec::new()
+                        },
                         ..Default::default()
                     }),
                     outputs: None,
@@ -345,6 +375,21 @@ impl Inference for MockVllmRs {
                             text,
                             num_tokens: token_ids.len() as u32,
                             token_ids,
+                            logprobs: frame_logprobs
+                                .as_ref()
+                                .and_then(|frames| frames.get(index))
+                                .map(|frame| frame.logprobs.clone())
+                                .unwrap_or_default(),
+                            ranks: frame_logprobs
+                                .as_ref()
+                                .and_then(|frames| frames.get(index))
+                                .map(|frame| frame.ranks.clone())
+                                .unwrap_or_default(),
+                            candidate_tokens: frame_logprobs
+                                .as_ref()
+                                .and_then(|frames| frames.get(index))
+                                .map(|frame| frame.candidates.clone())
+                                .unwrap_or_default(),
                             finish_info,
                             ..Default::default()
                         }),

@@ -247,6 +247,295 @@ async fn grpc_completion_batched_prompts_are_rejected_before_tokenize() {
 }
 
 #[tokio::test]
+async fn grpc_completion_logprobs_echo_round_trip() {
+    use axum::body::to_bytes;
+    use common::mock_vllm_rs::{FrameLogprobs, MockVllmRs};
+    use vllm_router_rs::backend::pb::candidate_token_info::TokenInfo;
+    use vllm_router_rs::backend::pb::{candidate_tokens, CandidateTokenInfo};
+    use vllm_router_rs::config::{PolicyConfig, RouterConfig};
+    use vllm_router_rs::routers::http::router::Router;
+
+    // Two streamed frames: ids [7, 8] then [9], each with logprobs, plus
+    // one candidate token (id 10) at the first output position.
+    let state = MockVllmRs {
+        frames: Some(vec![
+            ("".to_string(), vec![7, 8]),
+            ("".to_string(), vec![9]),
+        ]),
+        frame_logprobs: Some(vec![
+            FrameLogprobs {
+                logprobs: vec![-0.5, -0.6],
+                ranks: vec![1, 1],
+                candidates: vec![
+                    CandidateTokenInfo {
+                        tokens: vec![TokenInfo {
+                            id: 10,
+                            logprob: -1.0,
+                            rank: 2,
+                        }],
+                    },
+                    CandidateTokenInfo { tokens: vec![] },
+                ],
+            },
+            FrameLogprobs {
+                logprobs: vec![-0.7],
+                ranks: vec![1],
+                candidates: vec![CandidateTokenInfo { tokens: vec![] }],
+            },
+        ]),
+        emit_prompt_logprobs: true,
+        ..Default::default()
+    };
+    let model = fixture::model_fixture();
+    let worker = common::mock_vllm_rs::MockVllmRsServer::spawn_with_state(state).await;
+    let config = RouterConfig {
+        policy: PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        },
+        disable_circuit_breaker: true,
+        ..Default::default()
+    };
+    let context = common::create_test_context(config);
+    let router = Router::new(vec![worker.grpc_url.clone()], &context)
+        .await
+        .unwrap();
+
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": "hello prefix",
+        "logprobs": 2,
+        "echo": true,
+    }))
+    .unwrap();
+    let response = router
+        .route_typed_request(None, &request, "/v1/completions", None)
+        .await;
+    assert!(response.status().is_success());
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let choice = &json["choices"][0];
+    // Echo: the prompt text leads the generated text.
+    assert!(
+        choice["text"].as_str().unwrap().starts_with("hello prefix"),
+        "{choice}"
+    );
+    assert_eq!(choice["finish_reason"], "stop");
+    let logprobs = &choice["logprobs"];
+    let tokens = logprobs["tokens"].as_array().unwrap();
+    let token_logprobs = logprobs["token_logprobs"].as_array().unwrap();
+    let text_offset = logprobs["text_offset"].as_array().unwrap();
+    let top_logprobs = logprobs["top_logprobs"].as_array().unwrap();
+    // Prompt entries (first null, rest -0.1 from the mock) then 3 output
+    // entries [-0.5, -0.6, -0.7]; the prompt length is derived, not assumed.
+    assert_eq!(tokens.len(), token_logprobs.len());
+    assert_eq!(tokens.len(), text_offset.len());
+    assert_eq!(tokens.len(), top_logprobs.len());
+    assert!(token_logprobs[0].is_null());
+    assert_eq!(
+        &token_logprobs[token_logprobs.len() - 3..],
+        &[json!(-0.5), json!(-0.6), json!(-0.7)]
+    );
+    assert!(token_logprobs[1..token_logprobs.len() - 3]
+        .iter()
+        .all(|value| *value == json!(-0.1)));
+    // Offsets start at 0 and the first output token starts where the prompt
+    // text ends (12 chars for "hello prefix").
+    assert_eq!(text_offset[0], 0);
+    assert_eq!(text_offset[token_logprobs.len() - 3], 12);
+    for window in text_offset.windows(2) {
+        assert!(window[0].as_u64().unwrap() <= window[1].as_u64().unwrap());
+    }
+    // The sampled token joins the candidate map at the first output position.
+    let top0 = top_logprobs[token_logprobs.len() - 3].as_object().unwrap();
+    assert_eq!(top0.len(), 2);
+    let mut values: Vec<f64> = top0.values().map(|v| v.as_f64().unwrap()).collect();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(values, vec![-1.0, -0.5]);
+    assert_eq!(json["usage"]["completion_tokens"], 3);
+
+    // The wire request asked for exactly what the client asked for.
+    let captured = worker.captured();
+    assert_eq!(captured.len(), 1);
+    let options = captured[0].response_options.as_ref().unwrap();
+    assert!(options.output_logprobs);
+    assert!(options.prompt_logprobs);
+    assert!(matches!(
+        options
+            .output_candidates
+            .as_ref()
+            .and_then(|c| c.select.clone()),
+        Some(candidate_tokens::Select::TopN(2))
+    ));
+    assert!(matches!(
+        options
+            .prompt_candidates
+            .as_ref()
+            .and_then(|c| c.select.clone()),
+        Some(candidate_tokens::Select::TopN(2))
+    ));
+}
+
+#[tokio::test]
+async fn grpc_completion_echo_with_max_tokens_zero_returns_the_prompt_only() {
+    use axum::body::to_bytes;
+    use common::mock_vllm_rs::MockVllmRs;
+    use vllm_router_rs::config::{PolicyConfig, RouterConfig};
+    use vllm_router_rs::routers::http::router::Router;
+
+    let state = MockVllmRs {
+        emit_prompt_logprobs: true,
+        ..Default::default()
+    };
+    let model = fixture::model_fixture();
+    let worker = common::mock_vllm_rs::MockVllmRsServer::spawn_with_state(state).await;
+    let config = RouterConfig {
+        policy: PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        },
+        disable_circuit_breaker: true,
+        ..Default::default()
+    };
+    let context = common::create_test_context(config);
+    let router = Router::new(vec![worker.grpc_url.clone()], &context)
+        .await
+        .unwrap();
+
+    // Echo + max_tokens: 0: the answer is the prompt, the one token the
+    // engine had to generate is dropped.
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": "hello prefix",
+        "logprobs": 2,
+        "echo": true,
+        "max_tokens": 0,
+    }))
+    .unwrap();
+    let response = router
+        .route_typed_request(None, &request, "/v1/completions", None)
+        .await;
+    assert!(response.status().is_success());
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let choice = &json["choices"][0];
+    assert_eq!(choice["text"], "hello prefix");
+    assert_eq!(choice["finish_reason"], "stop");
+    let token_logprobs = choice["logprobs"]["token_logprobs"].as_array().unwrap();
+    assert!(token_logprobs[0].is_null());
+    assert!(token_logprobs[1..]
+        .iter()
+        .all(|value| *value == json!(-0.1)));
+    // The engine was asked for exactly one token.
+    assert_eq!(worker.captured().last().unwrap().max_new_tokens, 1);
+
+    // Without echo the same request answers with empty text.
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": "hello prefix",
+        "max_tokens": 0,
+    }))
+    .unwrap();
+    let response = router
+        .route_typed_request(None, &request, "/v1/completions", None)
+        .await;
+    assert!(response.status().is_success());
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["choices"][0]["text"], "");
+    assert!(json["choices"][0]["logprobs"].is_null());
+}
+
+#[tokio::test]
+async fn grpc_completion_logprobs_echo_streams_per_chunk() {
+    use axum::body::to_bytes;
+    use common::mock_vllm_rs::{FrameLogprobs, MockVllmRs};
+    use vllm_router_rs::config::{PolicyConfig, RouterConfig};
+    use vllm_router_rs::routers::http::router::Router;
+
+    let state = MockVllmRs {
+        frames: Some(vec![
+            ("".to_string(), vec![7, 8]),
+            ("".to_string(), vec![9]),
+        ]),
+        frame_logprobs: Some(vec![
+            FrameLogprobs {
+                logprobs: vec![-0.5, -0.6],
+                ranks: vec![1, 1],
+                candidates: vec![],
+            },
+            FrameLogprobs {
+                logprobs: vec![-0.7],
+                ranks: vec![1],
+                candidates: vec![],
+            },
+        ]),
+        emit_prompt_logprobs: true,
+        ..Default::default()
+    };
+    let model = fixture::model_fixture();
+    let worker = common::mock_vllm_rs::MockVllmRsServer::spawn_with_state(state).await;
+    let config = RouterConfig {
+        policy: PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        },
+        disable_circuit_breaker: true,
+        ..Default::default()
+    };
+    let context = common::create_test_context(config);
+    let router = Router::new(vec![worker.grpc_url.clone()], &context)
+        .await
+        .unwrap();
+
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": "hello prefix",
+        "logprobs": 2,
+        "echo": true,
+        "stream": true,
+    }))
+    .unwrap();
+    let response = router
+        .route_typed_request(None, &request, "/v1/completions", None)
+        .await;
+    assert!(response.status().is_success());
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    let chunks: Vec<serde_json::Value> = text
+        .split("\n\n")
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    assert!(!chunks.is_empty(), "{text}");
+    // The first chunk leads with the echoed prompt and prompt logprobs
+    // (first position null).
+    let first = &chunks[0]["choices"][0];
+    assert!(
+        first["text"].as_str().unwrap().starts_with("hello prefix"),
+        "{first}"
+    );
+    assert!(first["logprobs"]["token_logprobs"][0].is_null());
+    // A later chunk carries the first output token's logprob.
+    assert!(chunks.iter().any(|chunk| {
+        chunk["choices"][0]["logprobs"]["token_logprobs"]
+            .as_array()
+            .is_some_and(|values| values.iter().any(|v| *v == json!(-0.5)))
+    }));
+}
+
+#[tokio::test]
 async fn grpc_completion_text_prompt_bos_default_end_to_end() {
     use axum::body::to_bytes;
     use vllm_router_rs::config::{PolicyConfig, RouterConfig};
