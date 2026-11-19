@@ -329,6 +329,18 @@ impl EngineFrontend {
             .await
     }
 
+    /// Stage 3 fan-out: N units on one worker, merged into one response.
+    pub(crate) async fn dispatch_many_with_first_output(
+        &self,
+        units: Vec<crate::backend::grpc::FanoutUnit>,
+        n_per_prompt: usize,
+        on_first_output: Option<FirstOutputCallback>,
+    ) -> Response {
+        self.grpc
+            .dispatch_many_prepared(units, n_per_prompt, on_first_output)
+            .await
+    }
+
     pub fn remove_worker(&self, worker_url: &str) {
         self.grpc.remove_client(worker_url);
     }

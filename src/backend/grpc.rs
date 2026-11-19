@@ -549,8 +549,6 @@ impl GrpcEngineBackend {
                 Err(response) => return response,
             };
             metas.push(UnitMeta {
-                unit_id: unit.unit_id,
-                prompt_idx: unit.prompt_idx,
                 prompt_ids: unit.prepared.tokenized.token_ids.clone(),
                 echo_text: unit
                     .prepared
@@ -698,10 +696,9 @@ struct UnitStream {
 }
 
 /// Per-unit data the fan-out merge needs; the shared `ChatReply` carries the
-/// single request id/model/created and the shared sampling options.
+/// single request id/model/created and the shared sampling options. Metas are
+/// stored in unit-id order, so `metas[unit_id]` is that unit's data.
 struct UnitMeta {
-    unit_id: usize,
-    prompt_idx: usize,
     prompt_ids: Arc<[u32]>,
     echo_text: Option<String>,
 }

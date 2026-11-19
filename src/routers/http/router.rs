@@ -272,6 +272,10 @@ struct TypedDispatch<'a> {
     completion: Option<&'a CompletionRoute>,
     load: RequestLoadGuard,
     prepared: Option<crate::backend::PreparedRequest>,
+    /// Stage 3 fan-out: every prepared prompt, in client order. `None`
+    /// outside the gRPC completions path; the single `prepared` above is
+    /// the first unit, used for KV routing tokens and single dispatch.
+    prepared_completions: Option<Vec<crate::backend::PreparedRequest>>,
 }
 
 struct SelectedWorker {
@@ -1508,6 +1512,9 @@ impl Router {
         // The concrete request comes from `GenerationRequest::grpc_request`
         // rather than a `serde_json::Value` roundtrip: the only two routes a
         // gRPC pool admits are exactly the two concrete request types.
+        // Stage 3 fan-out keeps every prepared prompt here; the single
+        // `prepared` below is the first unit, for KV routing and dispatch.
+        let mut prepared_completions: Option<Vec<crate::backend::PreparedRequest>> = None;
         let prepared = match (pool, typed_req.grpc_request()) {
             (Some(crate::backend::WorkerPoolKind::Grpc), Some(GrpcRequestRef::Chat(chat)))
                 if route == "/v1/chat/completions" =>
@@ -1538,9 +1545,13 @@ impl Router {
                         .into_response();
                 }
                 match self.frontend.prepare_completions(completion).await {
-                    Ok(mut prepared) => {
-                        // The count check above guarantees exactly one.
-                        Some(prepared.pop().unwrap())
+                    Ok(prepared_vec) => {
+                        // The count check above guarantees exactly one
+                        // today; the whole batch is kept for Stage 3
+                        // fan-out, which lifts the check.
+                        let first = prepared_vec.first().cloned();
+                        prepared_completions = Some(prepared_vec);
+                        first
                     }
                     Err(error) => {
                         return (prepare_error_status(&error), error.to_string()).into_response();
@@ -1576,6 +1587,7 @@ impl Router {
         };
         let text = &text;
         let prepared = &prepared;
+        let prepared_completions = &prepared_completions;
         let completion = completion.as_ref();
         let cache_key = std::sync::OnceLock::new();
         let cache_key = &cache_key;
@@ -1774,6 +1786,7 @@ impl Router {
                             completion,
                             load,
                             prepared: (*prepared).clone(),
+                            prepared_completions: (*prepared_completions).clone(),
                         },
                         program_completion.clone(),
                     )
@@ -1957,6 +1970,7 @@ impl Router {
             completion,
             load,
             prepared,
+            prepared_completions,
         } = dispatch;
         let completion_echo = completion.map(|input| input.echo);
         let load_incremented = load.tracks_worker();
@@ -1985,6 +1999,47 @@ impl Router {
                 Some(Arc::new(move || load.begin_decode())
                     as crate::backend::grpc::FirstOutputCallback)
             };
+            // Stage 3 fan-out: P prompts x n choices, one unit each, all
+            // on this attempt's worker (the same worker one native `n`
+            // request would use). A single unit falls through to the
+            // single-unit path below.
+            if route == "/v1/completions" {
+                if let Some(prepared_vec) = prepared_completions {
+                    let n_per_prompt = prepared_vec
+                        .first()
+                        .and_then(|prepared| prepared.request.n)
+                        .unwrap_or(1)
+                        .max(1) as usize;
+                    if prepared_vec.len() * n_per_prompt > 1 {
+                        let units: Vec<crate::backend::grpc::FanoutUnit> = prepared_vec
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(prompt_idx, prepared)| {
+                                (0..n_per_prompt).map(move |choice_idx| {
+                                    crate::backend::grpc::FanoutUnit {
+                                        worker_url: worker_url.to_string(),
+                                        prepared: prepared.clone(),
+                                        handoff: crate::backend::grpc::KvHandoff::default(),
+                                        unit_id: prompt_idx * n_per_prompt + choice_idx,
+                                        prompt_idx,
+                                    }
+                                })
+                            })
+                            .collect();
+                        let mut response = self
+                            .frontend
+                            .dispatch_many_with_first_output(units, n_per_prompt, on_first_output)
+                            .await;
+                        if is_stream && response.status().is_success() {
+                            response = hold_request_load_until_body_done(response, load);
+                        }
+                        if let Some(completion) = &program_completion {
+                            completion.finish(response.status().is_success());
+                        }
+                        return response;
+                    }
+                }
+            }
             let mut response = self
                 .frontend
                 .dispatch_with_first_output(worker_url, prepared, on_first_output)
@@ -4717,6 +4772,7 @@ mod tests {
                     // false` expressed before the field became a guard.
                     load: RequestLoadGuard::new(None, None),
                     prepared: None,
+                    prepared_completions: None,
                 },
                 None,
             )
@@ -6117,6 +6173,7 @@ mod tests {
                     completion: Some(&completion),
                     load,
                     prepared: None,
+                    prepared_completions: None,
                 },
                 None,
             )
@@ -6300,6 +6357,7 @@ mod tests {
                         completion: Some(&completion),
                         load,
                         prepared: None,
+                        prepared_completions: None,
                     },
                     None,
                 )
