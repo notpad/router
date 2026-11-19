@@ -219,55 +219,89 @@ impl PdLoadManager {
         self.admit_inner(select, true)
     }
 
+    /// Admit N units atomically under a single loads lock.
+    ///
+    /// Stage 3 fan-out: one client request is N = P x n units, and each unit
+    /// goes through a complete admission. Calling `admit` N times would
+    /// release the lock between units (other requests interleave) and leave
+    /// the first N-1 holding slots when the Nth fails. Here the selector runs
+    /// N times against the post-charge load, so units spread across pairs,
+    /// and any failure rolls every charge back before returning `None`.
+    ///
+    /// Attempt handles are built after the lock is released: dropping one
+    /// re-enters the loads lock, which would deadlock under the held lock.
+    pub(super) fn admit_many(
+        &self,
+        mut select: impl FnMut(&Loads) -> Option<PdSelection>,
+        n: usize,
+        defer_decode: bool,
+    ) -> Option<Vec<(PdSelection, PdAttempt)>> {
+        let now = std::time::Instant::now();
+        let charged: Vec<(PdSelection, ChargedUnit)> = {
+            let mut loads = self.loads.lock();
+            let mut charged = Vec::with_capacity(n);
+            for _ in 0..n {
+                let Some(selection) = select(&loads) else {
+                    for (_, unit) in charged.iter().rev() {
+                        uncharge_selection(&mut loads, unit);
+                    }
+                    return None;
+                };
+                let unit = charge_selection(&mut loads, &selection, defer_decode, now);
+                charged.push((selection, unit));
+            }
+            charged
+        };
+        Some(
+            charged
+                .into_iter()
+                .map(|(selection, unit)| {
+                    let attempt = PdAttempt(Arc::new(AttemptInner {
+                        admitted_at: now,
+                        loads: self.loads.clone(),
+                        prefill: unit.prefill.clone(),
+                        prefill_worker: Mutex::new(None),
+                        decode_worker: Mutex::new(None),
+                        prefill_tokens: unit.prefill_tokens,
+                        state: Mutex::new(AttemptState {
+                            prefill: true,
+                            decode: unit.decode_state,
+                            decode_endpoint: unit.decode_endpoint,
+                            affinity: unit.affinity,
+                            pending_since: unit.pending_since,
+                        }),
+                    }));
+                    (selection, attempt)
+                })
+                .collect(),
+        )
+    }
+
     fn admit_inner(
         &self,
         select: impl FnOnce(&Loads) -> Option<PdSelection>,
         defer_decode: bool,
     ) -> Option<(PdSelection, PdAttempt)> {
-        let mut loads = self.loads.lock();
-        let selection = select(&loads)?;
-        let prefill = &selection.prefill;
-        let decode = &selection.decode;
-        // Neither stage is charged until both selections have succeeded.
-        let p = loads
-            .entry((Stage::Prefill, prefill.endpoint.clone()))
-            .or_default();
-        p.prefill_requests += 1;
-        if let Some(tokens) = prefill.new_prefill_tokens {
-            p.active_prefill_tokens += tokens;
-        } else {
-            p.unknown_prefill_requests += 1;
-        }
-        p.publish(Stage::Prefill, &prefill.endpoint);
         let now = std::time::Instant::now();
-        let (decode_endpoint, affinity, decode_state, pending_since) = if defer_decode {
-            (None, None, DecodeState::Unbound, None)
-        } else {
-            let d = loads
-                .entry((Stage::Decode, decode.endpoint.clone()))
-                .or_default();
-            d.pending_decode_requests += 1;
-            d.publish(Stage::Decode, &decode.endpoint);
-            (
-                Some(decode.endpoint.clone()),
-                decode.affinity.clone(),
-                DecodeState::Pending,
-                Some(now),
-            )
+        let (selection, unit) = {
+            let mut loads = self.loads.lock();
+            let selection = select(&loads)?;
+            let unit = charge_selection(&mut loads, &selection, defer_decode, now);
+            (selection, unit)
         };
         let attempt = PdAttempt(Arc::new(AttemptInner {
             admitted_at: now,
             loads: self.loads.clone(),
-            prefill: selection.prefill.endpoint.clone(),
+            prefill: unit.prefill.clone(),
             prefill_worker: Mutex::new(None),
             decode_worker: Mutex::new(None),
-            prefill_tokens: selection.prefill.new_prefill_tokens,
+            prefill_tokens: unit.prefill_tokens,
             state: Mutex::new(AttemptState {
                 prefill: true,
-                decode: decode_state,
-                decode_endpoint,
-                affinity,
-                pending_since,
+                decode: unit.decode_state,
+                decode_endpoint: unit.decode_endpoint,
+                affinity: unit.affinity,
+                pending_since: unit.pending_since,
             }),
         }));
         Some((selection, attempt))
@@ -346,6 +380,92 @@ impl PdLoadManager {
         }));
         attempt.attach_workers(prefill_worker, decode_worker);
         attempt
+    }
+}
+
+/// One unit's charge, recorded under the loads lock so its attempt handle
+/// can be built after the lock is released.
+struct ChargedUnit {
+    prefill: PdEndpoint,
+    prefill_tokens: Option<u64>,
+    decode_endpoint: Option<PdEndpoint>,
+    affinity: Option<Arc<AffinityRecord>>,
+    decode_state: DecodeState,
+    pending_since: Option<std::time::Instant>,
+}
+
+/// Charge one selection against `loads`. Neither stage is charged until the
+/// selection has succeeded; the caller owns rollback on failure.
+fn charge_selection(
+    loads: &mut Loads,
+    selection: &PdSelection,
+    defer_decode: bool,
+    now: std::time::Instant,
+) -> ChargedUnit {
+    let prefill = &selection.prefill;
+    let decode = &selection.decode;
+    let p = loads
+        .entry((Stage::Prefill, prefill.endpoint.clone()))
+        .or_default();
+    p.prefill_requests += 1;
+    if let Some(tokens) = prefill.new_prefill_tokens {
+        p.active_prefill_tokens += tokens;
+    } else {
+        p.unknown_prefill_requests += 1;
+    }
+    p.publish(Stage::Prefill, &prefill.endpoint);
+    let (decode_endpoint, affinity, decode_state, pending_since) = if defer_decode {
+        (None, None, DecodeState::Unbound, None)
+    } else {
+        let d = loads
+            .entry((Stage::Decode, decode.endpoint.clone()))
+            .or_default();
+        d.pending_decode_requests += 1;
+        d.publish(Stage::Decode, &decode.endpoint);
+        (
+            Some(decode.endpoint.clone()),
+            decode.affinity.clone(),
+            DecodeState::Pending,
+            Some(now),
+        )
+    };
+    ChargedUnit {
+        prefill: prefill.endpoint.clone(),
+        prefill_tokens: prefill.new_prefill_tokens,
+        decode_endpoint,
+        affinity,
+        decode_state,
+        pending_since,
+    }
+}
+
+/// Reverse `charge_selection`: subtract the charge and drop idle entries.
+/// Mirrors the arithmetic in `AttemptInner::finish_prefill` /
+/// `finish_decode`, but without an attempt handle (no worker counters: those
+/// are only incremented at attach time, after admission succeeds).
+fn uncharge_selection(loads: &mut Loads, charged: &ChargedUnit) {
+    let prefill_key = (Stage::Prefill, charged.prefill.clone());
+    if let Some(load) = loads.get_mut(&prefill_key) {
+        load.prefill_requests -= 1;
+        if let Some(tokens) = charged.prefill_tokens {
+            load.active_prefill_tokens -= tokens;
+        } else {
+            load.unknown_prefill_requests -= 1;
+        }
+        load.publish(Stage::Prefill, &charged.prefill);
+        if load.idle() {
+            loads.remove(&prefill_key);
+        }
+    }
+    if let Some(endpoint) = &charged.decode_endpoint {
+        let decode_key = (Stage::Decode, endpoint.clone());
+        if let Some(load) = loads.get_mut(&decode_key) {
+            load.pending_decode_requests -= 1;
+            load.publish(Stage::Decode, endpoint);
+            if load.idle() {
+                loads.remove(&decode_key);
+            }
+        }
     }
 }
 
@@ -651,5 +771,147 @@ mod tests {
             error_chain(&top),
             "prefill request failed caused by: HTTP send failed caused by: connection reset"
         );
+    }
+
+    fn test_endpoint(url: &str) -> PdEndpoint {
+        PdEndpoint {
+            http_url: url.to_string(),
+            dp_rank: None,
+        }
+    }
+
+    fn test_decision(
+        endpoint: PdEndpoint,
+        worker_index: usize,
+        tokens: Option<u64>,
+    ) -> StageDecision {
+        StageDecision {
+            fallback_reason: None,
+            credited_prefix_tokens: None,
+            worker_index,
+            endpoint,
+            score: None,
+            new_prefill_tokens: tokens,
+            affinity_outcome: None,
+            affinity: None,
+        }
+    }
+
+    fn test_selection(tokens: u64, call: usize) -> PdSelection {
+        // Alternate endpoints so the batch spreads across pairs.
+        let (prefill_url, decode_url) = if call % 2 == 0 {
+            ("http://p0", "http://d0")
+        } else {
+            ("http://p1", "http://d1")
+        };
+        PdSelection {
+            prefill: test_decision(test_endpoint(prefill_url), 0, Some(tokens)),
+            decode: test_decision(test_endpoint(decode_url), 0, None),
+        }
+    }
+
+    #[test]
+    fn admit_many_charges_all_units() {
+        let manager = PdLoadManager::default();
+        let calls = std::cell::Cell::new(0usize);
+        let admitted = manager.admit_many(
+            |_| {
+                let call = calls.get();
+                calls.set(call + 1);
+                Some(test_selection(10 * (call as u64 + 1), call))
+            },
+            3,
+            false,
+        );
+        let admitted = admitted.expect("all three units admit");
+        assert_eq!(admitted.len(), 3);
+        // p0/d0 take units 0 and 2 (10 + 30 tokens), p1/d1 take unit 1 (20).
+        let loads = manager.snapshot();
+        let p0 = loads
+            .get(&(Stage::Prefill, test_endpoint("http://p0")))
+            .unwrap();
+        assert_eq!(p0.prefill_requests, 2);
+        assert_eq!(p0.active_prefill_tokens, 40);
+        let p1 = loads
+            .get(&(Stage::Prefill, test_endpoint("http://p1")))
+            .unwrap();
+        assert_eq!(p1.prefill_requests, 1);
+        assert_eq!(p1.active_prefill_tokens, 20);
+        let d0 = loads
+            .get(&(Stage::Decode, test_endpoint("http://d0")))
+            .unwrap();
+        assert_eq!(d0.pending_decode_requests, 2);
+        let d1 = loads
+            .get(&(Stage::Decode, test_endpoint("http://d1")))
+            .unwrap();
+        assert_eq!(d1.pending_decode_requests, 1);
+        assert_eq!(
+            admitted[0].1.decode_endpoint(),
+            Some(test_endpoint("http://d0"))
+        );
+        assert_eq!(
+            admitted[1].1.decode_endpoint(),
+            Some(test_endpoint("http://d1"))
+        );
+    }
+
+    #[test]
+    fn admit_many_rolls_back_on_failure() {
+        let manager = PdLoadManager::default();
+        let calls = std::cell::Cell::new(0usize);
+        let admitted = manager.admit_many(
+            |_| {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call >= 2 {
+                    None
+                } else {
+                    Some(test_selection(10, call))
+                }
+            },
+            3,
+            false,
+        );
+        assert!(admitted.is_none());
+        assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn admit_many_deferred_charges_prefill_only() {
+        let manager = PdLoadManager::default();
+        let calls = std::cell::Cell::new(0usize);
+        let admitted = manager
+            .admit_many(
+                |_| {
+                    let call = calls.get();
+                    calls.set(call + 1);
+                    Some(test_selection(7, call))
+                },
+                2,
+                true,
+            )
+            .expect("deferred units admit");
+        assert_eq!(admitted.len(), 2);
+        assert!(admitted
+            .iter()
+            .all(|(_, attempt)| attempt.decode_pending_commit()));
+        assert!(admitted
+            .iter()
+            .all(|(_, attempt)| attempt.decode_endpoint().is_none()));
+        let loads = manager.snapshot();
+        assert_eq!(loads.len(), 2);
+        assert!(loads.contains_key(&(Stage::Prefill, test_endpoint("http://p0"))));
+        assert!(loads.contains_key(&(Stage::Prefill, test_endpoint("http://p1"))));
+    }
+
+    #[test]
+    fn admit_many_drop_releases_charges() {
+        let manager = PdLoadManager::default();
+        let admitted = manager
+            .admit_many(|_| Some(test_selection(5, 0)), 2, false)
+            .expect("units admit");
+        assert_eq!(admitted.len(), 2);
+        drop(admitted);
+        assert!(manager.snapshot().is_empty());
     }
 }
