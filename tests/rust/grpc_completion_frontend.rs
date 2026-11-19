@@ -280,6 +280,142 @@ async fn grpc_completion_batched_prompts_fan_out() {
 }
 
 #[tokio::test]
+async fn grpc_completion_n_greater_than_one_fans_out() {
+    use axum::body::to_bytes;
+    use vllm_router_rs::config::{PolicyConfig, RouterConfig};
+    use vllm_router_rs::routers::http::router::Router;
+
+    let model = fixture::model_fixture();
+    let worker = common::mock_vllm_rs::MockVllmRsServer::spawn().await;
+    let config = RouterConfig {
+        policy: PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        },
+        disable_circuit_breaker: true,
+        ..Default::default()
+    };
+    let context = common::create_test_context(config);
+    let router = Router::new(vec![worker.grpc_url.clone()], &context)
+        .await
+        .unwrap();
+
+    // One prompt, n=2: two units on the same prompt, prompt tokens counted
+    // once (not x2), completion summed (3 + 3).
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": "hello",
+        "n": 2,
+        "stop": "zzz",
+    }))
+    .unwrap();
+    let response = router
+        .route_typed_request(None, &request, "/v1/completions", None)
+        .await;
+    assert!(response.status().is_success());
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let choices = json["choices"].as_array().unwrap();
+    assert_eq!(choices.len(), 2);
+    assert_eq!(choices[0]["index"], 0);
+    assert_eq!(choices[1]["index"], 1);
+    assert_eq!(choices[0]["text"], "hello from worker");
+    assert_eq!(choices[1]["text"], "hello from worker");
+
+    let captured = worker.captured();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[0].token_ids, captured[1].token_ids);
+    assert_ne!(captured[0].request_id, captured[1].request_id);
+    let prompt_total = captured[0].token_ids.len();
+    assert_eq!(json["usage"]["prompt_tokens"], prompt_total);
+    assert_eq!(json["usage"]["completion_tokens"], 6);
+    assert_eq!(json["usage"]["total_tokens"], prompt_total + 6);
+}
+
+#[tokio::test]
+async fn grpc_completion_batched_prompts_stream_fans_out_with_one_done() {
+    use axum::body::to_bytes;
+    use vllm_router_rs::config::{PolicyConfig, RouterConfig};
+    use vllm_router_rs::routers::http::router::Router;
+
+    let model = fixture::model_fixture();
+    let worker = common::mock_vllm_rs::MockVllmRsServer::spawn().await;
+    let config = RouterConfig {
+        policy: PolicyConfig::KvAware {
+            router_temperature: 0.0,
+            kv_penalty_host: 0.8,
+            kv_penalty_external: 0.6,
+            kv_penalty_disk: 0.3,
+            static_kv_event_sources: Default::default(),
+        },
+        disable_circuit_breaker: true,
+        ..Default::default()
+    };
+    let context = common::create_test_context(config);
+    let router = Router::new(vec![worker.grpc_url.clone()], &context)
+        .await
+        .unwrap();
+
+    // Streaming fan-out: one chunk per unit (each carries a single
+    // choice), exactly one [DONE] at the end, no usage chunk without
+    // stream_options.include_usage.
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": ["first", "second"],
+        "stop": "zzz",
+        "stream": true,
+    }))
+    .unwrap();
+    let response = router
+        .route_typed_request(None, &request, "/v1/completions", None)
+        .await;
+    assert!(response.status().is_success());
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+    assert_eq!(text.matches("data: [DONE]").count(), 1, "{text}");
+    let chunks: Vec<serde_json::Value> = text
+        .split("\n\n")
+        .filter_map(|frame| frame.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    assert_eq!(chunks.len(), 2, "{text}");
+    let mut indices: Vec<u64> = chunks
+        .iter()
+        .flat_map(|chunk| {
+            chunk["choices"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|choice| choice["index"].as_u64().unwrap())
+        })
+        .collect();
+    indices.sort_unstable();
+    assert_eq!(indices, vec![0, 1], "{text}");
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| chunk["choices"].as_array().unwrap().len() == 1),
+        "{text}"
+    );
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| chunk["choices"][0]["finish_reason"] == "stop"),
+        "{text}"
+    );
+    assert!(
+        chunks.iter().all(|chunk| chunk.get("usage").is_none()),
+        "{text}"
+    );
+}
+
+#[tokio::test]
 async fn grpc_completion_streaming_prompt_logprobs_without_echo_is_rejected() {
     use axum::body::to_bytes;
     use axum::http::StatusCode;
