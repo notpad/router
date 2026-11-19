@@ -1440,18 +1440,13 @@ async fn stream_openai_many(
                         let Some(outputs) = &msg.outputs else {
                             continue;
                         };
-                        // Each unit's engine stream carries one sequence
-                        // (`n = 1` at the engine), so its `index` is 0; the
-                        // merged index is the unit id.
-                        let index = unit_id + outputs.index as usize;
-                        if index >= sequences.len() {
-                            sequences.resize_with(index + 1, || SequenceAccum::new(0));
-                        }
-                        while detoks.len() <= index {
-                            detoks.push(tok.as_ref().map(|tokenizer| {
-                                decode_stream(&**tokenizer, prompt_ids.as_ref(), skip_special)
-                            }));
-                        }
+                        // Each unit's engine stream carries exactly one
+                        // sequence (`n = 1` at the engine): the merged index
+                        // is the unit id. Never trust the engine's `index`
+                        // field here — a non-conformant value must not land
+                        // a frame in another unit's sequence.
+                        debug_assert_eq!(outputs.index, 0);
+                        let index = unit_id;
                         let (delta, finish) = match sequence_text_and_finish(
                             outputs,
                             &mut detoks[index],
@@ -2049,18 +2044,14 @@ async fn collect_openai_many(
                 let Some(outputs) = &msg.outputs else {
                     continue;
                 };
-                // Each unit's engine stream carries one sequence
-                // (`n = 1` at the engine), so its `index` is 0; the merged
-                // index is the unit id.
-                let index = unit_id + outputs.index as usize;
-                if index >= sequences.len() {
-                    sequences.resize_with(index + 1, || SequenceAccum::new(0));
-                }
-                while detoks.len() <= index {
-                    detoks.push(tok.as_ref().map(|tokenizer| {
-                        decode_stream(&**tokenizer, prompt_ids.as_ref(), skip_special)
-                    }));
-                }
+                // Each unit's engine stream carries exactly one sequence
+                // (`n = 1` at the engine): the merged index is the unit id.
+                // Never trust the engine's `index` field here — a
+                // non-conformant value must not land a frame in another
+                // unit's sequence (and growing `sequences` past `metas`
+                // would panic the choices loop below).
+                debug_assert_eq!(outputs.index, 0);
+                let index = unit_id;
                 let (delta, finish) =
                     match sequence_text_and_finish(outputs, &mut detoks[index], prefer_worker_text)
                     {
