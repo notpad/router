@@ -336,6 +336,16 @@ struct CliArgs {
     #[arg(long, default_value_t = 32768)]
     max_concurrent_requests: usize,
 
+    /// Maximum fan-out (prompts x n choices) for one /v1/completions
+    /// request on a regular pool
+    #[arg(long, default_value_t = 16)]
+    max_completion_fanout: usize,
+
+    /// Same cap for the P/D path, lower: each unit costs a full prefill, a
+    /// KV transfer and a decode reservation
+    #[arg(long, default_value_t = 4)]
+    max_completion_fanout_pd: usize,
+
     /// CORS allowed origins
     #[arg(long, num_args = 0..)]
     cors_allowed_origins: Vec<String>,
@@ -653,6 +663,8 @@ impl CliArgs {
                 Some(self.request_id_headers.clone())
             },
             max_concurrent_requests: self.max_concurrent_requests,
+            max_completion_fanout: self.max_completion_fanout,
+            max_completion_fanout_pd: self.max_completion_fanout_pd,
             queue_size: 100,        // Default queue size
             queue_timeout_secs: 60, // Default timeout
             cors_allowed_origins: self.cors_allowed_origins.clone(),

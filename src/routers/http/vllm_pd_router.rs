@@ -107,6 +107,10 @@ pub struct VllmPDRouter {
     intra_node_data_parallel_size: usize,
     /// KV connector type
     kv_connector: KvConnector,
+    /// Maximum fan-out (prompts x n choices) for one /v1/completions
+    /// request on the P/D path, lower than the regular pool: each unit
+    /// costs a full prefill, a KV transfer and a decode reservation.
+    max_completion_fanout_pd: usize,
     /// Mooncake bootstrap info: prefill base_url -> MooncakePrefillInfo
     mooncake_prefill_info: Arc<Mutex<HashMap<String, MooncakePrefillInfo>>>,
     /// NIXL push identity per prefill base_url and dp_rank; never held across an await.
@@ -2154,6 +2158,20 @@ impl VllmPDRouter {
             crate::protocols::spec::PromptInput::IntBatch(batch) => batch.len(),
         };
         let n_per_prompt = body.n.unwrap_or(1).max(1) as usize;
+        // The P/D cap is lower than the regular pool's: each unit costs a
+        // full prefill, a KV transfer and a decode reservation. Enforced
+        // before any lowering or admission; there is no partial fan-out.
+        if prompt_count * n_per_prompt > self.max_completion_fanout_pd {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "completion fan-out {} exceeds max_completion_fanout_pd {}",
+                    prompt_count * n_per_prompt,
+                    self.max_completion_fanout_pd
+                ),
+            )
+                .into_response();
+        }
         if prompt_count * n_per_prompt <= 1 {
             let lowered = match crate::backend::prepare_grpc_completion(body) {
                 Ok(lowered) => lowered,
@@ -3484,6 +3502,7 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
+                max_completion_fanout_pd: ctx.router_config.max_completion_fanout_pd,
                 mooncake_prefill_info: Arc::new(Mutex::new(HashMap::new())),
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend: crate::backend::EngineFrontend::new(),
@@ -3604,6 +3623,7 @@ impl VllmPDRouter {
                 profiling_tasks: Arc::new(Mutex::new(HashMap::new())),
                 intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
                 kv_connector,
+                max_completion_fanout_pd: ctx.router_config.max_completion_fanout_pd,
                 mooncake_prefill_info,
                 nixl_prefill_info: RwLock::new(HashMap::new()),
                 grpc_frontend,

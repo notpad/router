@@ -184,11 +184,10 @@ impl EngineFrontend {
     /// and retry) through the same `PromptEncoder` chat uses, so L0 applies
     /// (L1 prefix reuse only when `add_special_tokens` is false); client ids
     /// pass through untouched. One `PreparedRequest` comes back per prompt sequence, in client order —
-    /// that is the fan-out unit Stage 3 will dispatch. The HTTP route serves
-    /// exactly one sequence and rejects a batch with 400 before any
-    /// tokenization happens; fanning out batched prompts is Stage 3.
-    /// The gRPC P/D route never calls this: it lowers through the
-    /// token-id-only `prepare_grpc_completion` and `prepare_token_ids`.
+    /// that is the fan-out unit Stage 3 dispatches; the HTTP route caps the
+    /// batch (P x n) before calling this, and the gRPC P/D route never calls
+    /// this: it lowers through the token-id-only `prepare_grpc_completion`
+    /// and `prepare_token_ids`.
     pub async fn prepare_completions(
         &self,
         request: &CompletionRequest,

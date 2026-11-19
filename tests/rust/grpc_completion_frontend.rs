@@ -186,7 +186,7 @@ async fn grpc_completion_batch_prepare_returns_one_request_per_prompt() {
 }
 
 #[tokio::test]
-async fn grpc_completion_batched_prompts_are_rejected_before_tokenize() {
+async fn grpc_completion_batched_prompts_fan_out() {
     use axum::body::to_bytes;
     use axum::http::StatusCode;
     use vllm_router_rs::config::{PolicyConfig, RouterConfig};
@@ -210,10 +210,60 @@ async fn grpc_completion_batched_prompts_are_rejected_before_tokenize() {
         .await
         .unwrap();
 
-    // Batched with a model: 400, and nothing is dispatched.
+    // Two prompts fan out to two units on the one worker and merge into a
+    // single response: prompt-major choices, one id/model, prompt tokens
+    // counted once per prompt (1 + 2), completion summed (3 + 3). The
+    // `stop` makes the router prefer the worker's text over its own
+    // detokenization (see `requires_worker_output_text`), so the choice
+    // text is the mock's reply text.
     let request: CompletionRequest = serde_json::from_value(json!({
         "model": model.path().to_str().unwrap(),
         "prompt": ["first", "second"],
+        "stop": "zzz",
+    }))
+    .unwrap();
+    let response = router
+        .route_typed_request(None, &request, "/v1/completions", None)
+        .await;
+    assert!(response.status().is_success());
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["id"].is_string());
+    let choices = json["choices"].as_array().unwrap();
+    assert_eq!(choices.len(), 2);
+    assert_eq!(choices[0]["index"], 0);
+    assert_eq!(choices[1]["index"], 1);
+    assert_eq!(choices[0]["text"], "hello from worker");
+    assert_eq!(choices[1]["text"], "hello from worker");
+
+    // Two GenerateStream calls, one per unit, each carrying its own
+    // engine request id ("<id>-u<unit_id>") and its own prompt ids.
+    let mut captured = worker.captured();
+    assert_eq!(captured.len(), 2);
+    captured.sort_by_key(|call| call.token_ids.clone());
+    assert_ne!(captured[0].token_ids, captured[1].token_ids);
+    assert!(!captured[0].token_ids.is_empty());
+    assert!(!captured[1].token_ids.is_empty());
+    assert_ne!(captured[0].request_id, captured[1].request_id);
+    let ids: Vec<&str> = captured
+        .iter()
+        .map(|call| call.request_id.as_str())
+        .collect();
+    assert!(ids.iter().all(|id| id.starts_with("cmpl-")), "{ids:?}");
+    assert!(ids.iter().any(|id| id.ends_with("-u0")), "{ids:?}");
+    assert!(ids.iter().any(|id| id.ends_with("-u1")), "{ids:?}");
+    // Usage: prompt tokens counted once per prompt (the two prompts'
+    // token counts summed), completion summed over both units (3 + 3).
+    let prompt_total: usize = captured.iter().map(|call| call.token_ids.len()).sum();
+    assert_eq!(json["usage"]["prompt_tokens"], prompt_total);
+    assert_eq!(json["usage"]["completion_tokens"], 6);
+    assert_eq!(json["usage"]["total_tokens"], prompt_total + 6);
+
+    // Over the fan-out cap (default 16): 400 before any dispatch.
+    let prompts: Vec<&str> = vec!["x"; 17];
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": model.path().to_str().unwrap(),
+        "prompt": prompts,
     }))
     .unwrap();
     let response = router
@@ -222,28 +272,11 @@ async fn grpc_completion_batched_prompts_are_rejected_before_tokenize() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert!(
-        String::from_utf8_lossy(&body).contains("batched prompts"),
+        String::from_utf8_lossy(&body).contains("max_completion_fanout"),
         "{}",
         String::from_utf8_lossy(&body)
     );
-    assert!(worker.captured().is_empty());
-
-    // Batched without a model: still 400, not 503. The batch check runs
-    // before tokenizer resolution, so a batch is never tokenized first —
-    // the old order reached resolution here and answered 503.
-    let request: CompletionRequest =
-        serde_json::from_value(json!({"prompt": ["first", "second"]})).unwrap();
-    let response = router
-        .route_typed_request(None, &request, "/v1/completions", None)
-        .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    assert!(
-        String::from_utf8_lossy(&body).contains("batched prompts"),
-        "{}",
-        String::from_utf8_lossy(&body)
-    );
-    assert!(worker.captured().is_empty());
+    assert_eq!(worker.captured().len(), 2);
 }
 
 #[tokio::test]

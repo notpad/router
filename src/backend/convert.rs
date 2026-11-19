@@ -593,7 +593,7 @@ pub fn prepare_grpc_completion_prompts(
             (prompts, echo_texts)
         }
     };
-    let rejected: [(&str, bool, Option<&str>); 5] = [
+    let rejected: [(&str, bool, Option<&str>); 4] = [
         ("suffix", request.suffix.is_some(), None),
         ("best_of", request.best_of.is_some(), None),
         (
@@ -602,7 +602,6 @@ pub fn prepare_grpc_completion_prompts(
             Some("use regex or ebnf"),
         ),
         ("return_hidden_states", request.return_hidden_states, None),
-        ("n > 1", request.n.unwrap_or(1) > 1, Some("use n=1")),
     ];
     if let Some((field, _, hint)) = rejected.iter().find(|(_, present, _)| *present) {
         let hint = hint.map(|hint| format!("; {hint}")).unwrap_or_default();
@@ -1136,7 +1135,6 @@ mod tests {
                 "suffix",
             ),
             (serde_json::json!({"prompt": [1], "best_of": 3}), "best_of"),
-            (serde_json::json!({"prompt": [1], "n": 2}), "n > 1"),
             (
                 serde_json::json!({"prompt": [1], "json_schema": "{\"type\":\"object\"}"}),
                 "json_schema",
@@ -1165,6 +1163,25 @@ mod tests {
             .chat
             .echo
             .unwrap_or(false));
+    }
+
+    #[test]
+    fn completion_n_greater_than_one_lowers_for_fan_out() {
+        // Stage 3: n > 1 no longer rejects at lowering; the fan-out
+        // dispatch carries one choice per unit with n = 1 each.
+        let lowered = prepare_grpc_completion_prompts(&completion(
+            serde_json::json!({"prompt": [1], "n": 2}),
+        ))
+        .unwrap();
+        assert_eq!(lowered.prompts.len(), 1);
+        assert_eq!(lowered.chat.n, Some(2));
+
+        let batched = prepare_grpc_completion_prompts(&completion(
+            serde_json::json!({"prompt": [[1], [2]], "n": 2}),
+        ))
+        .unwrap();
+        assert_eq!(batched.prompts.len(), 2);
+        assert_eq!(batched.chat.n, Some(2));
     }
 
     #[test]

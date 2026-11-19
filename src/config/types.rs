@@ -57,6 +57,15 @@ pub struct RouterConfig {
     pub request_id_headers: Option<Vec<String>>,
     /// Maximum concurrent requests allowed (for rate limiting)
     pub max_concurrent_requests: usize,
+    /// Maximum fan-out (prompts x n choices) for one /v1/completions
+    /// request on a regular pool. A larger request is rejected with 400
+    /// before tokenization; there is no partial fan-out.
+    #[serde(default = "default_max_completion_fanout")]
+    pub max_completion_fanout: usize,
+    /// Same cap for the P/D path, lower: each unit costs a full prefill, a
+    /// KV transfer and a decode reservation on scarcer capacity.
+    #[serde(default = "default_max_completion_fanout_pd")]
+    pub max_completion_fanout_pd: usize,
     /// Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately)
     pub queue_size: usize,
     /// Maximum time (in seconds) a request can wait in queue before timing out
@@ -123,6 +132,14 @@ fn default_history_backend() -> HistoryBackend {
 
 fn default_intra_node_data_parallel_size() -> usize {
     1
+}
+
+fn default_max_completion_fanout() -> usize {
+    16
+}
+
+fn default_max_completion_fanout_pd() -> usize {
+    4
 }
 
 /// Router-level Program scheduling configuration.
@@ -1317,6 +1334,8 @@ impl Default for RouterConfig {
             log_level: None,
             request_id_headers: None,
             max_concurrent_requests: 32768,
+            max_completion_fanout: default_max_completion_fanout(),
+            max_completion_fanout_pd: default_max_completion_fanout_pd(),
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
@@ -2107,6 +2126,8 @@ mod tests {
             log_level: Some("info".to_string()),
             request_id_headers: None,
             max_concurrent_requests: 64,
+            max_completion_fanout: default_max_completion_fanout(),
+            max_completion_fanout_pd: default_max_completion_fanout_pd(),
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -2177,6 +2198,8 @@ mod tests {
             log_level: Some("debug".to_string()),
             request_id_headers: None,
             max_concurrent_requests: 64,
+            max_completion_fanout: default_max_completion_fanout(),
+            max_completion_fanout_pd: default_max_completion_fanout_pd(),
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -2243,6 +2266,8 @@ mod tests {
             log_level: Some("trace".to_string()),
             request_id_headers: None,
             max_concurrent_requests: 64,
+            max_completion_fanout: default_max_completion_fanout(),
+            max_completion_fanout_pd: default_max_completion_fanout_pd(),
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),

@@ -293,6 +293,10 @@ pub struct Router {
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval_secs: u64,
     intra_node_data_parallel_size: usize,
+    /// Maximum fan-out (prompts x n choices) for one /v1/completions
+    /// request on a regular pool. Larger requests are rejected with 400
+    /// before tokenization.
+    max_completion_fanout: usize,
     api_key: Option<String>,
     retry_config: RetryConfig,
     circuit_breaker_config: CircuitBreakerConfig,
@@ -663,6 +667,7 @@ impl Router {
                 .router_config
                 .worker_startup_check_interval_secs,
             intra_node_data_parallel_size: ctx.router_config.intra_node_data_parallel_size,
+            max_completion_fanout: ctx.router_config.max_completion_fanout,
             api_key: ctx.router_config.api_key.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             circuit_breaker_config: core_cb_config,
@@ -1533,22 +1538,23 @@ impl Router {
                 // Count sequences from the raw prompt, without lowering:
                 // lowering allocates the text or token ids just to count
                 // them, then `prepare_completions` below would lower the
-                // same request again. A batch is rejected before any
-                // tokenization — dispatching more than one sequence is
-                // Stage 3's fan-out — and a tokenizer error can no longer
-                // mask the 400.
-                if completion.prompt.len() != 1 {
+                // same request again. The fan-out cap is the only gate
+                // here: anything at or under it fans out in Stage 3, and
+                // a tokenizer error can no longer mask the 400.
+                let fanout = completion.prompt.len() * completion.n.unwrap_or(1).max(1) as usize;
+                if fanout > self.max_completion_fanout {
                     return (
                         StatusCode::BAD_REQUEST,
-                        "gRPC /v1/completions does not support batched prompts yet",
+                        format!(
+                            "completion fan-out {fanout} exceeds max_completion_fanout {}",
+                            self.max_completion_fanout
+                        ),
                     )
                         .into_response();
                 }
                 match self.frontend.prepare_completions(completion).await {
                     Ok(prepared_vec) => {
-                        // The count check above guarantees exactly one
-                        // today; the whole batch is kept for Stage 3
-                        // fan-out, which lifts the check.
+                        // The whole batch is kept for Stage 3 fan-out.
                         let first = prepared_vec.first().cloned();
                         prepared_completions = Some(prepared_vec);
                         first
@@ -5520,6 +5526,7 @@ mod tests {
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 1,
+            max_completion_fanout: 16,
             api_key: None,
             client: Client::new(),
             retry_config: RetryConfig::default(),
@@ -5554,6 +5561,7 @@ mod tests {
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 1,
+            max_completion_fanout: 16,
             api_key: None,
             client: Client::new(),
             retry_config: RetryConfig::default(),
@@ -6998,6 +7006,7 @@ mod tests {
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             intra_node_data_parallel_size: 1,
+            max_completion_fanout: 16,
             api_key: None,
             client: Client::new(),
             retry_config: RetryConfig::default(),

@@ -813,6 +813,8 @@ mod test_pd_routing {
                 log_level: None,
                 request_id_headers: None,
                 max_concurrent_requests: 64,
+                max_completion_fanout: 16,
+                max_completion_fanout_pd: 4,
                 queue_size: 0,
                 queue_timeout_secs: 60,
                 cors_allowed_origins: vec![],

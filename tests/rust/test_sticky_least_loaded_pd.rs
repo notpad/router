@@ -49,6 +49,8 @@ mod sticky_least_loaded_pd_tests {
             worker_startup_timeout_secs: 5,
             worker_startup_check_interval_secs: 1,
             max_concurrent_requests: 64,
+            max_completion_fanout: 16,
+            max_completion_fanout_pd: 4,
             queue_size: 0,
             profile_timeout_secs: 30,
             ..RouterConfig::default()
