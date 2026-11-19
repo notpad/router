@@ -761,6 +761,86 @@ impl PdRouterBase {
         admitted
     }
 
+    /// Batch admission for Stage 3 fan-out: one selection per context, all
+    /// charged atomically under a single loads lock. The selector runs once
+    /// per unit against the post-charge load, so units spread across pairs;
+    /// any failure rolls every charge back. Mirrors
+    /// [`select_and_admit_with`](Self::select_and_admit_with) per unit
+    /// (metrics, worker attach) after admission succeeds.
+    pub(super) fn select_and_admit_many_with(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        contexts: &[PdRequestContext<'_>],
+        defer_decode: bool,
+    ) -> Option<Vec<(PdSelection, PdAttempt)>> {
+        let first = contexts.first()?;
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+        let defer = defer_decode && decode_policy_can_defer(decode_policy.as_ref(), first);
+        let mut index = 0usize;
+        let select = |loads: &Loads| {
+            let context = contexts.get(index)?;
+            index += 1;
+            if let Some(kv) =
+                kv_aware_ops(decode_policy.as_ref()).filter(|kv| kv.session_affinity_enabled())
+            {
+                kv.reconcile_decode_workers(decode_workers);
+            }
+            select_pd_pair(
+                loads,
+                prefill_workers,
+                decode_workers,
+                prefill_policy.as_ref(),
+                decode_policy.as_ref(),
+                context,
+                !defer,
+            )
+        };
+        let admitted = self.pd_load.admit_many(select, contexts.len(), defer)?;
+        for (selection, attempt) in &admitted {
+            let deferred = attempt.decode_pending_commit();
+            if kv_aware_ops(prefill_policy.as_ref()).is_some() {
+                crate::metrics::RouterMetrics::record_pd_kv_decision(
+                    selection.prefill.new_prefill_tokens,
+                    selection.prefill.credited_prefix_tokens,
+                    selection.prefill.fallback_reason,
+                );
+            }
+            // A deferred decode decision is provisional, so its affinity
+            // outcome is recorded by the commit, not here.
+            if !deferred {
+                if let Some(outcome) = selection.decode.affinity_outcome {
+                    crate::metrics::RouterMetrics::record_pd_affinity_decision("decode", outcome);
+                }
+            }
+            if let Some(prefill_worker) = prefill_workers.get(selection.prefill.worker_index) {
+                if deferred {
+                    attempt.attach_prefill_worker(prefill_worker.clone());
+                } else if let Some(decode_worker) =
+                    decode_workers.get(selection.decode.worker_index)
+                {
+                    attempt.attach_workers(prefill_worker.clone(), decode_worker.clone());
+                }
+            }
+            debug!(
+                version = 1,
+                prefill_policy = prefill_policy.name(),
+                decode_policy = decode_policy.name(),
+                decode_deferred = deferred,
+                fallback = ?selection.prefill.fallback_reason,
+                new_prefill_tokens = ?selection.prefill.new_prefill_tokens,
+                credited_prefix_tokens = ?selection.prefill.credited_prefix_tokens,
+                prefill_score = ?selection.prefill.score,
+                decode_score = ?selection.decode.score,
+                decode_sticky = ?selection.decode.fallback_reason,
+                ?selection,
+                "P/D batch admission"
+            );
+        }
+        Some(admitted)
+    }
+
     // Private helper method to perform health check on a new server
     async fn wait_for_server_health(&self, url: &str) -> Result<(), PDRouterError> {
         crate::routers::http::router::Router::wait_for_healthy_workers(

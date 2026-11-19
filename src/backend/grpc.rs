@@ -494,7 +494,6 @@ impl GrpcEngineBackend {
     pub(crate) async fn dispatch_many_prepared(
         &self,
         units: Vec<FanoutUnit>,
-        n_per_prompt: usize,
         on_first_output: Option<FirstOutputCallback>,
     ) -> Response {
         if units.is_empty() {
@@ -549,6 +548,7 @@ impl GrpcEngineBackend {
                 Err(response) => return response,
             };
             metas.push(UnitMeta {
+                prompt_idx: unit.prompt_idx,
                 prompt_ids: unit.prepared.tokenized.token_ids.clone(),
                 echo_text: unit
                     .prepared
@@ -593,9 +593,9 @@ impl GrpcEngineBackend {
             abort: aborts,
         };
         if request.stream {
-            stream_openai_many(streams, metas, reply, n_per_prompt).await
+            stream_openai_many(streams, metas, reply).await
         } else {
-            collect_openai_many(streams, metas, reply, n_per_prompt).await
+            collect_openai_many(streams, metas, reply).await
         }
     }
 
@@ -699,18 +699,21 @@ struct UnitStream {
 /// single request id/model/created and the shared sampling options. Metas are
 /// stored in unit-id order, so `metas[unit_id]` is that unit's data.
 struct UnitMeta {
+    prompt_idx: usize,
     prompt_ids: Arc<[u32]>,
     echo_text: Option<String>,
 }
 
 /// Merged `prompt_tokens`: each prompt counts once, not once per choice.
-/// Units are ordered by `unit_id = prompt_idx * n + choice_idx`, so the
-/// first unit of each prompt carries that prompt's token count.
-fn merged_prompt_tokens(prompt_tokens: &[u32], n_per_prompt: usize) -> u32 {
-    let n_per_prompt = n_per_prompt.max(1);
+/// Grouping by `prompt_idx` (not by position) keeps this correct even if
+/// units ever arrive out of `unit_id` order.
+fn merged_prompt_tokens(prompt_tokens: &[u32], metas: &[UnitMeta]) -> u32 {
+    let mut seen = std::collections::HashSet::new();
     prompt_tokens
-        .chunks(n_per_prompt)
-        .map(|chunk| chunk.first().copied().unwrap_or(0))
+        .iter()
+        .zip(metas.iter())
+        .filter(|(_, meta)| seen.insert(meta.prompt_idx))
+        .map(|(tokens, _)| *tokens)
         .sum()
 }
 
@@ -1301,7 +1304,6 @@ async fn stream_openai_many(
     unit_streams: Vec<UnitStream>,
     metas: Vec<UnitMeta>,
     reply: ChatReply,
-    n_per_prompt: usize,
 ) -> Response {
     let ChatReply {
         request_id,
@@ -1604,7 +1606,7 @@ async fn stream_openai_many(
                                 if finished_count >= n_units {
                                     if include_usage {
                                         let prompt_total =
-                                            merged_prompt_tokens(&prompt_tokens, n_per_prompt);
+                                            merged_prompt_tokens(&prompt_tokens, &metas);
                                         let usage = Usage {
                                             prompt_tokens: prompt_total,
                                             completion_tokens,
@@ -1936,7 +1938,6 @@ async fn collect_openai_many(
     unit_streams: Vec<UnitStream>,
     metas: Vec<UnitMeta>,
     reply: ChatReply,
-    n_per_prompt: usize,
 ) -> Response {
     let ChatReply {
         request_id,
@@ -2128,7 +2129,7 @@ async fn collect_openai_many(
         warn!(%request_id, "gRPC decode finished aborted");
         return (StatusCode::BAD_GATEWAY, "gRPC decode finished aborted").into_response();
     }
-    let prompt_total = merged_prompt_tokens(&prompt_tokens, n_per_prompt);
+    let prompt_total = merged_prompt_tokens(&prompt_tokens, &metas);
     let usage = Usage {
         prompt_tokens: prompt_total,
         completion_tokens,

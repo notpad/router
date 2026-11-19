@@ -1218,6 +1218,130 @@ impl VllmPDRouter {
         })
     }
 
+    /// Batch admission for Stage 3 fan-out: one `PdRequestContext` per unit
+    /// (each unit scores its own prompt ids), all admitted atomically via
+    /// `select_and_admit_many_with`. The request-level pieces (policy text,
+    /// headers, affinity key) are shared; the token inputs and cache
+    /// selections are per unit.
+    #[allow(clippy::too_many_arguments)]
+    async fn admit_many_pairs_with_tokens(
+        &self,
+        prefill_workers: &[Arc<dyn Worker>],
+        decode_workers: &[Arc<dyn Worker>],
+        request: &Value,
+        path: &str,
+        headers: Option<&HeaderMap>,
+        forward_policy_headers: bool,
+        router_prompts: &[Arc<[Vec<u32>]>],
+        defer_decode: bool,
+    ) -> Option<Vec<Admission>> {
+        if router_prompts.is_empty() {
+            return None;
+        }
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+        let text = [prefill_policy.as_ref(), decode_policy.as_ref()]
+            .iter()
+            .any(|policy| !policy.needs_cache_routing_key() && policy.needs_request_text())
+            .then(|| serde_json::to_string(request).ok())
+            .flatten();
+        let needs_headers = forward_policy_headers
+            && (prefill_policy.needs_headers() || decode_policy.needs_headers());
+        let policy_headers = header_utils::to_policy_headers(headers.filter(|_| needs_headers));
+        let model_id = request.get("model").and_then(Value::as_str);
+        let cache_salt = request
+            .get("cache_salt")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let affinity_key = Self::extract_affinity_key(decode_policy.as_ref(), headers, request);
+        // Per-unit prepared inputs. Sequential: each unit's inputs are
+        // independent, but the cache-tree lookups are cheap next to a prefill.
+        struct UnitInputs {
+            prefill_inputs: Option<HashMap<String, super::pd_types::PdPrefillInput>>,
+            decode_tokens: WorkerTokenInputs,
+            prefill_cache: Option<crate::policies::PreparedCacheSelection>,
+            decode_cache: Option<Arc<crate::policies::PreparedCacheSelection>>,
+        }
+        let mut units = Vec::with_capacity(router_prompts.len());
+        for prompts in router_prompts {
+            let (prefill_inputs, decode_inputs) = tokio::join!(
+                self.pd_router.prepare_prefill_inputs(
+                    prefill_workers,
+                    request,
+                    path,
+                    headers,
+                    Some(prompts)
+                ),
+                self.pd_router.prepare_decode_inputs(
+                    decode_workers,
+                    request,
+                    path,
+                    headers,
+                    Some(prompts)
+                ),
+            );
+            let prefill_tokens: WorkerTokenInputs = prefill_inputs
+                .iter()
+                .filter(|_| prefill_policy.name() == "cache_aware")
+                .flat_map(|inputs| inputs.iter())
+                .filter_map(|(base, input)| {
+                    input
+                        .prompts
+                        .as_ref()
+                        .map(|prompts| (base.clone(), prompts.clone()))
+                })
+                .collect();
+            let decode_tokens = decode_inputs.unwrap_or_default();
+            let [prefill_cache, decode_cache] = [
+                (prefill_policy.as_ref(), prefill_workers, &prefill_tokens),
+                (decode_policy.as_ref(), decode_workers, &decode_tokens),
+            ]
+            .map(|(policy, workers, inputs)| {
+                policy.prepare_cache_selection(workers, inputs, model_id, None, cache_salt)
+            });
+            let decode_cache = decode_cache.map(Arc::new);
+            units.push(UnitInputs {
+                prefill_inputs,
+                decode_tokens,
+                prefill_cache,
+                decode_cache,
+            });
+        }
+        let contexts: Vec<PdRequestContext<'_>> = units
+            .iter()
+            .map(|unit| PdRequestContext {
+                prefill_inputs: unit.prefill_inputs.as_ref(),
+                model_id,
+                legacy_policy_input: text.as_deref(),
+                prefill_cache: unit.prefill_cache.as_ref(),
+                decode_cache: unit.decode_cache.as_deref(),
+                headers: policy_headers.as_ref(),
+                affinity_key: affinity_key.clone(),
+                lora_name: request.get(NAMED_LORA_FIELD).and_then(Value::as_str),
+                cache_salt,
+                route: path,
+            })
+            .collect();
+        let admitted = self.pd_router.select_and_admit_many_with(
+            prefill_workers,
+            decode_workers,
+            &contexts,
+            defer_decode,
+        )?;
+        Some(
+            units
+                .into_iter()
+                .zip(admitted)
+                .map(|(unit, (selection, attempt))| Admission {
+                    selection,
+                    attempt,
+                    decode_tokens: unit.decode_cache.map(|_| unit.decode_tokens),
+                    affinity_key: affinity_key.clone(),
+                })
+                .collect(),
+        )
+    }
+
     /// Whether this deployment can defer the decode commitment.
     ///
     /// Deferral needs a sequential dispatch: the Prefill request must not carry
@@ -2014,33 +2138,92 @@ impl VllmPDRouter {
 
     /// `/v1/completions` on static `grpc://` pools: the client already sends
     /// token ids, so there is no router-side tokenize and admission scores P by
-    /// those same ids.
+    /// those same ids. A single unit keeps the exact old path; P prompts x n
+    /// choices with P*n > 1 fans out through `route_grpc_prepared_many`.
     async fn route_grpc_completion(
         &self,
         headers: Option<&HeaderMap>,
         body: &crate::protocols::spec::CompletionRequest,
         request_json: Value,
     ) -> Response {
-        let lowered = match crate::backend::prepare_grpc_completion(body) {
+        // Fan-out size from the raw request, without lowering.
+        let prompt_count = match &body.prompt {
+            crate::protocols::spec::PromptInput::String(_) => 1,
+            crate::protocols::spec::PromptInput::StringArray(texts) => texts.len(),
+            crate::protocols::spec::PromptInput::IntArray(_) => 1,
+            crate::protocols::spec::PromptInput::IntBatch(batch) => batch.len(),
+        };
+        let n_per_prompt = body.n.unwrap_or(1).max(1) as usize;
+        if prompt_count * n_per_prompt <= 1 {
+            let lowered = match crate::backend::prepare_grpc_completion(body) {
+                Ok(lowered) => lowered,
+                Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+            };
+            let workers = match self.available_grpc_workers() {
+                Ok(workers) => workers,
+                Err(response) => return *response,
+            };
+            let prepared = match self
+                .grpc_frontend
+                .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return (prepare_error_status(&error), error.to_string()).into_response();
+                }
+            };
+            return self
+                .route_grpc_prepared(headers, request_json, "/v1/completions", prepared, workers)
+                .await;
+        }
+        // Fan-out: lower every prompt (token ids only; the P/D path does no
+        // router-side tokenization), then admit + prefill per unit.
+        let lowered = match crate::backend::prepare_grpc_completion_prompts(body) {
             Ok(lowered) => lowered,
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         };
+        if let Err(error) =
+            crate::backend::reject_unsupported_pd_completion_options(&lowered.options)
+        {
+            return (StatusCode::BAD_REQUEST, error).into_response();
+        }
         let workers = match self.available_grpc_workers() {
             Ok(workers) => workers,
             Err(response) => return *response,
         };
-        let prepared = match self
-            .grpc_frontend
-            .prepare_token_ids(lowered.chat, lowered.token_ids, lowered.emit_token_ids)
-            .await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return (prepare_error_status(&error), error.to_string()).into_response();
+        let mut prepared = Vec::with_capacity(lowered.prompts.len());
+        for prompt in lowered.prompts {
+            let ids = match prompt {
+                crate::backend::CompletionPrompt::Ids(ids) => ids,
+                crate::backend::CompletionPrompt::Text(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "gRPC /v1/completions requires token-id prompts (list[int] or list[list[int]])",
+                    )
+                        .into_response();
+                }
+            };
+            match self
+                .grpc_frontend
+                .prepare_token_ids(lowered.chat.clone(), ids, lowered.emit_token_ids)
+                .await
+            {
+                Ok(p) => prepared.push(p),
+                Err(error) => {
+                    return (prepare_error_status(&error), error.to_string()).into_response();
+                }
             }
-        };
-        self.route_grpc_prepared(headers, request_json, "/v1/completions", prepared, workers)
-            .await
+        }
+        self.route_grpc_prepared_many(
+            headers,
+            request_json,
+            "/v1/completions",
+            prepared,
+            n_per_prompt,
+            workers,
+        )
+        .await
     }
 
     /// Shared gRPC P/D admission and dispatch for an already prepared request.
@@ -2113,6 +2296,216 @@ impl VllmPDRouter {
             )
             .await;
         attempt.track_response(response)
+    }
+
+    /// One unit's prefill leg on the standard (sequential) path: generate
+    /// ids, build prefill params, run the prefill, and build decode params.
+    /// Mirrors the prefill half of `process_grpc_two_stage`; the NIXL
+    /// concurrent branch is excluded (see the push check in
+    /// `route_grpc_prepared_many`). On failure the attempt is already
+    /// released and the error response is returned.
+    async fn prefill_grpc_unit(
+        &self,
+        prepared: &crate::backend::PreparedRequest,
+        prefill_worker: &Arc<dyn Worker>,
+        decode_worker: &Arc<dyn Worker>,
+        path: &str,
+        attempt: &PdAttempt,
+        start_time: Instant,
+    ) -> Result<(String, Option<serde_json::Value>), Response> {
+        let prefill_base_url = prefill_worker.base_url().to_string();
+        let prefill_dp_rank = prefill_worker.dp_rank();
+        let decode_base_url = decode_worker.base_url().to_string();
+        let request_id = Self::generate_vllm_request_id(
+            &self.get_zmq_address(prefill_worker.as_ref(), ServiceType::Prefill),
+            &self.get_zmq_address(decode_worker.as_ref(), ServiceType::Decode),
+        );
+        let transfer_id = self.generate_transfer_id();
+        let prefill_params = match self.build_prefill_kv_transfer_params(
+            transfer_id.as_deref(),
+            Some(&decode_base_url),
+            decode_worker.dp_size(),
+            decode_worker.dp_rank(),
+        ) {
+            Ok(params) => params,
+            Err(reason) => {
+                attempt.release();
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, reason).into_response());
+            }
+        };
+        let prefill_result = self
+            .grpc_frontend
+            .prefill(
+                prefill_worker.url(),
+                prepared,
+                request_id.clone(),
+                &prefill_params,
+            )
+            .await;
+        attempt.finish_prefill();
+        let prefill_kv = match prefill_result {
+            Ok(kv) => kv,
+            Err(response) => {
+                attempt.release();
+                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, start_time.elapsed());
+                return Err(response);
+            }
+        };
+        let prefill_response_json = match prefill_kv {
+            Some(kv) => json!({ "kv_transfer_params": kv }),
+            None => json!({}),
+        };
+        let decode_params = self
+            .build_decode_kv_transfer_params(
+                &prefill_base_url,
+                Some(&prefill_response_json),
+                transfer_id.as_deref(),
+                prefill_worker.dp_size(),
+                prefill_dp_rank.map(|rank| rank as u32),
+                Some(&request_id),
+            )
+            .await;
+        if decode_params.is_none() {
+            warn!(
+                "No kv_transfer_params for prefill {}, decode will proceed without them",
+                prefill_base_url
+            );
+        }
+        Ok((request_id, decode_params))
+    }
+
+    /// Shared gRPC P/D admission and dispatch for N fan-out units (Stage 3).
+    /// A single unit delegates to `route_grpc_prepared`, so Stage 1/2
+    /// behavior is untouched. N > 1 forces no deferral: a deferred commit
+    /// failure would waste N prefills + KV transfers. Units that would take
+    /// the NIXL-push concurrent path are refused (503) instead of prefilling
+    /// on the wrong path; the client can retry with n=1.
+    async fn route_grpc_prepared_many(
+        &self,
+        headers: Option<&HeaderMap>,
+        request_json: Value,
+        path: &str,
+        prepared: Vec<crate::backend::PreparedRequest>,
+        n_per_prompt: usize,
+        workers: GrpcPdWorkers,
+    ) -> Response {
+        let total = prepared.len() * n_per_prompt;
+        if total <= 1 {
+            let Some(single) = prepared.into_iter().next() else {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "fan-out requires at least one prompt",
+                )
+                    .into_response();
+            };
+            return self
+                .route_grpc_prepared(headers, request_json, path, single, workers)
+                .await;
+        }
+        let GrpcPdWorkers {
+            prefill: prefill_workers,
+            decode: decode_workers,
+        } = workers;
+        // One admission per unit: each unit's prompt ids score its own pair.
+        let router_prompts: Vec<Arc<[Vec<u32>]>> = (0..total)
+            .map(|unit_id| {
+                let prompt_idx = unit_id / n_per_prompt;
+                Arc::from([prepared[prompt_idx].tokenized.token_ids.to_vec()])
+            })
+            .collect();
+        let Some(admissions) = self
+            .admit_many_pairs_with_tokens(
+                &prefill_workers,
+                &decode_workers,
+                &request_json,
+                path,
+                headers,
+                true,
+                &router_prompts,
+                false,
+            )
+            .await
+        else {
+            RouterMetrics::record_pd_error("server_selection");
+            return (StatusCode::SERVICE_UNAVAILABLE, "No eligible P/D pair").into_response();
+        };
+        // NIXL push needs the concurrent path (decode opens while prefill
+        // runs); the fan-out prefill leg is sequential, so refuse instead of
+        // pushing KV to a decode worker that is not registered yet.
+        if matches!(self.kv_connector, KvConnector::Nixl) {
+            for admission in &admissions {
+                let prefill_worker = &prefill_workers[admission.selection.prefill.worker_index];
+                if self
+                    .get_nixl_push_identity(
+                        &prefill_worker.base_url().to_string(),
+                        prefill_worker.dp_rank(),
+                    )
+                    .is_some()
+                {
+                    RouterMetrics::record_pd_error("server_selection");
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "gRPC P/D fan-out does not support NIXL push; use n=1",
+                    )
+                        .into_response();
+                }
+            }
+        }
+        // Sequential prefill legs, one per unit; any failure releases every
+        // attempt and fails the whole request with one error.
+        let start_time = Instant::now();
+        let mut fanout_units = Vec::with_capacity(total);
+        for unit_id in 0..total {
+            let prompt_idx = unit_id / n_per_prompt;
+            let admission = &admissions[unit_id];
+            let prefill_worker = prefill_workers[admission.selection.prefill.worker_index].clone();
+            let decode_worker = decode_workers[admission.selection.decode.worker_index].clone();
+            let (request_id, decode_params) = match self
+                .prefill_grpc_unit(
+                    &prepared[prompt_idx],
+                    &prefill_worker,
+                    &decode_worker,
+                    path,
+                    &admission.attempt,
+                    start_time,
+                )
+                .await
+            {
+                Ok(opened) => opened,
+                Err(response) => {
+                    // Release every attempt (already-prefilled units
+                    // included); their KV is unused and their load charges
+                    // drop.
+                    for admission in &admissions {
+                        admission.attempt.release();
+                    }
+                    return response;
+                }
+            };
+            admission.attempt.begin_decode();
+            fanout_units.push(crate::backend::grpc::FanoutUnit {
+                worker_url: decode_worker.url().to_string(),
+                prepared: prepared[prompt_idx].clone(),
+                handoff: crate::backend::grpc::KvHandoff {
+                    engine_request_id: Some(request_id),
+                    kv_transfer_params: decode_params,
+                },
+                unit_id,
+                prompt_idx,
+            });
+        }
+        let mut response = self
+            .grpc_frontend
+            .dispatch_many_with_first_output(fanout_units, None)
+            .await;
+        // Each attempt owns its decode leg through the merged body, exactly
+        // as the single-unit path owns it through `track_response`.
+        for admission in admissions {
+            response = admission.attempt.track_response(response);
+        }
+        response
     }
 
     /// Two-stage request processing for vLLM disaggregated mode

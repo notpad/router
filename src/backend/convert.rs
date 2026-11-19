@@ -776,6 +776,30 @@ pub fn prepare_grpc_completion_prompts(
 /// batched prompts are rejected here; text goes through
 /// `prepare_grpc_completion_prompts` on the regular-pool path, which the P/D
 /// route never calls.
+/// Stage 2 (logprobs/echo) landed on the regular-pool path only: the P/D
+/// response path has no accumulator, so anything that needs one stays a 400
+/// here instead of being silently dropped. Shared by the single-prompt and
+/// fan-out P/D entries.
+pub fn reject_unsupported_pd_completion_options(options: &CompletionOptions) -> Result<(), String> {
+    for (field, present) in [
+        ("logprobs", options.logprobs.is_some()),
+        ("echo", options.echo),
+        ("prompt_logprobs", options.prompt_logprobs.is_some()),
+        ("logprob_token_ids", options.logprob_token_ids.is_some()),
+        (
+            "return_tokens_as_token_ids",
+            options.return_tokens_as_token_ids,
+        ),
+    ] {
+        if present {
+            return Err(format!(
+                "{field} is not supported by the gRPC /v1/completions path"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCompletion, String> {
     let PromptInput::IntArray(ids) = &request.prompt else {
         return Err(
@@ -793,25 +817,7 @@ pub fn prepare_grpc_completion(request: &CompletionRequest) -> Result<PreparedCo
         emit_token_ids,
         ..
     } = lowered;
-    // Stage 2 (logprobs/echo) landed on the regular-pool path only: the P/D
-    // response path has no accumulator, so anything that needs one stays a
-    // 400 here instead of being silently dropped.
-    for (field, present) in [
-        ("logprobs", options.logprobs.is_some()),
-        ("echo", options.echo),
-        ("prompt_logprobs", options.prompt_logprobs.is_some()),
-        ("logprob_token_ids", options.logprob_token_ids.is_some()),
-        (
-            "return_tokens_as_token_ids",
-            options.return_tokens_as_token_ids,
-        ),
-    ] {
-        if present {
-            return Err(format!(
-                "{field} is not supported by the gRPC /v1/completions path"
-            ));
-        }
-    }
+    reject_unsupported_pd_completion_options(&options)?;
     let token_ids = match prompts.pop() {
         Some(CompletionPrompt::Ids(ids)) if prompts.is_empty() => ids,
         // An `IntArray` lowers to exactly one `Ids` entry.

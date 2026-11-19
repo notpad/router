@@ -333,11 +333,10 @@ impl EngineFrontend {
     pub(crate) async fn dispatch_many_with_first_output(
         &self,
         units: Vec<crate::backend::grpc::FanoutUnit>,
-        n_per_prompt: usize,
         on_first_output: Option<FirstOutputCallback>,
     ) -> Response {
         self.grpc
-            .dispatch_many_prepared(units, n_per_prompt, on_first_output)
+            .dispatch_many_prepared(units, on_first_output)
             .await
     }
 

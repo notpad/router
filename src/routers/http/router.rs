@@ -2028,7 +2028,7 @@ impl Router {
                             .collect();
                         let mut response = self
                             .frontend
-                            .dispatch_many_with_first_output(units, n_per_prompt, on_first_output)
+                            .dispatch_many_with_first_output(units, on_first_output)
                             .await;
                         if is_stream && response.status().is_success() {
                             response = hold_request_load_until_body_done(response, load);
