@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
+use futures_util::stream::select_all;
 use futures_util::StreamExt;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -474,7 +475,7 @@ impl GrpcEngineBackend {
             t_req,
             on_first_output,
             fail_on_abort: abort_request_id.is_some(),
-            abort,
+            abort: vec![abort],
         };
         // Stage 2 keeps `n = 1` (the completions lower rejects `n > 1` and
         // the engine rejects `num_sequences > 1`); the accumulator is
@@ -486,6 +487,234 @@ impl GrpcEngineBackend {
             collect_openai(stream, reply, n_choices).await
         }
     }
+
+    /// Dispatch N fan-out units and merge them into one client response.
+    /// A single unit takes the exact single-unit path instead, so Stage 1/2
+    /// behavior is untouched.
+    pub(crate) async fn dispatch_many_prepared(
+        &self,
+        units: Vec<FanoutUnit>,
+        n_per_prompt: usize,
+        on_first_output: Option<FirstOutputCallback>,
+    ) -> Response {
+        if units.is_empty() {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fan-out requires at least one unit",
+            )
+                .into_response();
+        }
+        if units.len() == 1 {
+            let unit = units.into_iter().next().unwrap();
+            return self
+                .dispatch_prepared(
+                    &unit.worker_url,
+                    unit.prepared,
+                    on_first_output,
+                    unit.handoff,
+                )
+                .await;
+        }
+        // Shared identity: one id/model/created for every unit and chunk.
+        // Clone the first unit's prepared request: the loop moves `units`
+        // by value, so no borrow of it may outlive this point.
+        let first = units[0].prepared.clone();
+        let request = first.request.as_ref();
+        let request_id = match first.shape {
+            ResponseShape::Chat => format!("chatcmpl-{}", Uuid::new_v4()),
+            ResponseShape::Completion => format!("cmpl-{}", Uuid::new_v4()),
+        };
+        let model = request.model.clone().unwrap_or_else(|| "unknown".into());
+        let created = now_secs();
+        let t_open = Instant::now();
+        let mut streams = Vec::with_capacity(units.len());
+        let mut metas = Vec::with_capacity(units.len());
+        let mut aborts = Vec::with_capacity(units.len());
+        let mut fail_on_abort = false;
+        let mut total_prompt_tokens = 0usize;
+        for unit in units {
+            fail_on_abort |= unit.handoff.engine_request_id.is_some();
+            total_prompt_tokens += unit.prepared.tokenized.token_ids.len();
+            let (stream, abort) = match self
+                .open_unit_stream(
+                    &unit.worker_url,
+                    &unit.prepared,
+                    &unit.handoff,
+                    unit.unit_id,
+                    &request_id,
+                )
+                .await
+            {
+                Ok(opened) => opened,
+                Err(response) => return response,
+            };
+            metas.push(UnitMeta {
+                unit_id: unit.unit_id,
+                prompt_idx: unit.prompt_idx,
+                prompt_ids: unit.prepared.tokenized.token_ids.clone(),
+                echo_text: unit
+                    .prepared
+                    .completion
+                    .as_ref()
+                    .and_then(|options| options.echo_text.clone()),
+            });
+            aborts.push(abort);
+            streams.push(UnitStream {
+                unit_id: unit.unit_id,
+                stream,
+            });
+        }
+        let xfer_ms = t_open.elapsed().as_secs_f64() * 1000.0;
+        let reply = ChatReply {
+            request_id,
+            model,
+            created,
+            tok: first.handle.tokenizer(),
+            prompt_ids: first.tokenized.token_ids.clone(),
+            skip_special: request.skip_special_tokens,
+            prefer_worker_text: requires_worker_output_text(request),
+            include_usage: request
+                .stream_options
+                .as_ref()
+                .and_then(|options| options.include_usage)
+                .unwrap_or(false),
+            shape: first.shape,
+            emit_token_ids: first.emit_token_ids,
+            completion: first.completion.clone(),
+            request_timeout: self.request_timeout,
+            stages: serde_json::json!({
+                "path": "grpc",
+                "n_prompt_tokens": total_prompt_tokens,
+                "resolve_ms": first.resolve_ms,
+                "frontend_ms": first.tokenized.frontend_ms(),
+                "xfer_ms": xfer_ms,
+            }),
+            t_req: first.t_req,
+            on_first_output,
+            fail_on_abort,
+            abort: aborts,
+        };
+        if request.stream {
+            stream_openai_many(streams, metas, reply, n_per_prompt).await
+        } else {
+            collect_openai_many(streams, metas, reply, n_per_prompt).await
+        }
+    }
+
+    /// Open one unit's GenerateStream. The proto carries `n = 1` (the engine
+    /// rejects `num_sequences > 1`) and a per-unit seed (`seed + unit_id`),
+    /// so n identical-seed units do not generate identical text.
+    async fn open_unit_stream(
+        &self,
+        worker_url: &str,
+        prepared: &PreparedRequest,
+        handoff: &KvHandoff,
+        unit_id: usize,
+        request_id: &str,
+    ) -> Result<
+        (
+            tonic::Streaming<super::pb::GenerateResponse>,
+            EngineAbortGuard,
+        ),
+        Response,
+    > {
+        let request = prepared.request.as_ref();
+        let mut unit_request = request.clone();
+        unit_request.n = Some(1);
+        unit_request.seed = request.seed.map(|seed| seed.wrapping_add(unit_id as i64));
+        let engine_request_id = handoff
+            .engine_request_id
+            .clone()
+            .unwrap_or_else(|| format!("{request_id}-u{unit_id}"));
+        let mut proto = chat_to_generate_request_with_options(
+            &unit_request,
+            prepared.tokenized.token_ids.as_ref().to_vec(),
+            engine_request_id.clone(),
+            prepared.completion.as_ref(),
+        )
+        .map_err(|error| (StatusCode::BAD_REQUEST, error).into_response())?;
+        if let Some(params) = &handoff.kv_transfer_params {
+            set_kv_transfer_params(&mut proto, params)
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error).into_response())?;
+        }
+        let channel = self.channel_for(worker_url).await.map_err(|error| {
+            error!(error = %error, "grpc backend connect failed");
+            (StatusCode::BAD_GATEWAY, error).into_response()
+        })?;
+        let mut abort =
+            EngineAbortGuard::new(&channel, Some(&engine_request_id), self.connect_timeout);
+        let mut client = InferenceClient::new(channel);
+        let mut tonic_req = tonic::Request::new(proto);
+        tonic_req.set_timeout(self.request_timeout);
+        if let Some(rank) = parse_dp_rank(worker_url) {
+            tonic_req
+                .metadata_mut()
+                .insert(DP_RANK_METADATA, rank.to_string().parse().unwrap());
+        }
+        let stream =
+            match tokio::time::timeout(self.request_timeout, client.generate_stream(tonic_req))
+                .await
+            {
+                Ok(Ok(s)) => {
+                    abort.answered();
+                    s.into_inner()
+                }
+                Ok(Err(status)) => {
+                    abort.disarm();
+                    warn!(code = ?status.code(), msg = %status.message(), "GenerateStream failed");
+                    return Err((
+                        grpc_status_code(&status),
+                        format!("grpc GenerateStream: {}", status.message()),
+                    )
+                        .into_response());
+                }
+                Err(_) => {
+                    return Err((
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "grpc GenerateStream exceeded request timeout",
+                    )
+                        .into_response());
+                }
+            };
+        Ok((stream, abort))
+    }
+}
+
+/// One Stage 3 fan-out unit: a single engine GenerateStream (`n = 1` at the
+/// engine) whose merged choice index is `unit_id`
+/// (`prompt_idx * n + choice_idx`).
+pub(crate) struct FanoutUnit {
+    pub worker_url: String,
+    pub prepared: PreparedRequest,
+    pub handoff: KvHandoff,
+    pub unit_id: usize,
+    pub prompt_idx: usize,
+}
+
+/// One fan-out unit's engine stream, tagged with its merged choice index.
+struct UnitStream {
+    unit_id: usize,
+    stream: tonic::Streaming<super::pb::GenerateResponse>,
+}
+
+/// Per-unit data the fan-out merge needs; the shared `ChatReply` carries the
+/// single request id/model/created and the shared sampling options.
+struct UnitMeta {
+    unit_id: usize,
+    prompt_idx: usize,
+    prompt_ids: Arc<[u32]>,
+    echo_text: Option<String>,
+}
+
+/// Merged `prompt_tokens`: each prompt counts once, not once per choice.
+/// Units are ordered by `unit_id = prompt_idx * n + choice_idx`, so the
+/// first unit of each prompt carries that prompt's token count.
+fn merged_prompt_tokens(prompt_tokens: &[u32], n_per_prompt: usize) -> u32 {
+    let n_per_prompt = n_per_prompt.max(1);
+    prompt_tokens
+        .chunks(n_per_prompt)
+        .map(|chunk| chunk.first().copied().unwrap_or(0))
+        .sum()
 }
 
 fn stages_header(stages: &serde_json::Value) -> HeaderValue {
@@ -512,7 +741,8 @@ struct ChatReply {
     /// A P/D decode leg reports an `abort` finish as an error, so the push
     /// path can cancel P instead of returning an aborted reply as success.
     fail_on_abort: bool,
-    abort: EngineAbortGuard,
+    /// One guard per engine stream; fan-out holds one per unit.
+    abort: Vec<EngineAbortGuard>,
 }
 
 fn fill_engine_ms(stages: &mut serde_json::Value) {
@@ -1041,7 +1271,399 @@ async fn stream_openai(
         }
         .await;
         if finished {
-            abort.disarm();
+            for guard in abort {
+                guard.disarm();
+            }
+        } else {
+            failed_tx.send_replace(true);
+        }
+    });
+
+    let body = Body::from_stream(UnboundedReceiverStream::new(rx));
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache");
+    if stages_on {
+        builder = builder.header("x-router-stages", stages_header(&header_stages));
+    }
+    let mut response = builder
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    response
+        .extensions_mut()
+        .insert(GrpcStreamTask::with_output_frame(producer, output_frame).with_failure(failed_rx));
+    response
+}
+
+/// Streaming merge for Stage 3 fan-out: poll N unit streams concurrently
+/// and forward each unit's chunks with its merged choice index. One `[DONE]`
+/// and one usage chunk go out only after every unit finishes; any unit
+/// failure fails the whole request.
+async fn stream_openai_many(
+    unit_streams: Vec<UnitStream>,
+    metas: Vec<UnitMeta>,
+    reply: ChatReply,
+    n_per_prompt: usize,
+) -> Response {
+    let ChatReply {
+        request_id,
+        model,
+        created,
+        tok,
+        prompt_ids: _,
+        skip_special,
+        prefer_worker_text,
+        include_usage,
+        shape,
+        emit_token_ids,
+        completion,
+        request_timeout,
+        mut stages,
+        t_req,
+        on_first_output: _,
+        fail_on_abort: _,
+        abort,
+    } = reply;
+    let echo = completion.as_ref().is_some_and(|options| options.echo);
+    let echo_only = completion.as_ref().is_some_and(|options| options.echo_only);
+    let want_logprobs = completion
+        .as_ref()
+        .is_some_and(|options| options.logprobs.is_some());
+    let as_token_ids = completion
+        .as_ref()
+        .is_some_and(|options| options.return_tokens_as_token_ids);
+    let want_prompt_logprobs = completion
+        .as_ref()
+        .and_then(completion_prompt_logprobs)
+        .is_some();
+    let logprob_token_ids = completion
+        .as_ref()
+        .and_then(|options| options.logprob_token_ids.clone());
+    let header_stages = stages.clone();
+    let stages_on = crate::backend::stages_enabled();
+    let (tx, rx) = mpsc::unbounded_channel::<Result<String, std::io::Error>>();
+    let (mut producer_output_frame, output_frame) = output_frame_tracking();
+    let (failed_tx, failed_rx) = watch::channel(false);
+    let n_units = metas.len();
+    let producer = tokio::spawn(async move {
+        let finished = async {
+            let mut sequences: Vec<SequenceAccum> = metas
+                .iter()
+                .map(|meta| {
+                    let echo_len = if echo {
+                        meta.echo_text
+                            .as_deref()
+                            .map(|text| text.chars().count() as u32)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    SequenceAccum::new(echo_len)
+                })
+                .collect();
+            let mut detoks: Vec<Option<Box<dyn IncrementalDecoderTrait + '_>>> = metas
+                .iter()
+                .map(|meta| {
+                    tok.as_ref().map(|tokenizer| {
+                        decode_stream(&**tokenizer, meta.prompt_ids.as_ref(), skip_special)
+                    })
+                })
+                .collect();
+            let mut prompt_logprobs: Vec<Option<LogProbs>> = vec![None; n_units];
+            let mut prompt_logprobs_sent = vec![false; n_units];
+            let mut sent_output_logprobs = vec![false; n_units];
+            let mut prompt_tokens: Vec<u32> = metas
+                .iter()
+                .map(|meta| meta.prompt_ids.len() as u32)
+                .collect();
+            let mut completion_tokens = 0u32;
+            let mut first = true;
+            let mut first_token_logged = false;
+            let mut finished_units = vec![false; n_units];
+            let mut finished_count = 0usize;
+            let mut all_done = false;
+            let mut merged = select_all(unit_streams.into_iter().map(|unit| {
+                let unit_id = unit.unit_id;
+                Box::pin(unit.stream.map(move |item| (unit_id, item)))
+            }));
+            while !all_done {
+                let item = match tokio::time::timeout(request_timeout, merged.next()).await {
+                    Ok(Some(item)) => item,
+                    Ok(None) => break,
+                    Err(_) => {
+                        let _ = send_stream_chunk(
+                            &tx,
+                            &mut producer_output_frame,
+                            error_frame("gRPC stream exceeded request timeout"),
+                            false,
+                        );
+                        return false;
+                    }
+                };
+                let (unit_id, item) = item;
+                match item {
+                    Ok(msg) => {
+                        if stages.get("first_grpc_msg_ms").is_none() {
+                            stages["first_grpc_msg_ms"] =
+                                serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
+                        }
+                        let meta = &metas[unit_id];
+                        let prompt_ids = &meta.prompt_ids;
+                        if let Some(info) = &msg.prompt_info {
+                            prompt_tokens[unit_id] = info.num_prompt_tokens;
+                            if want_prompt_logprobs && prompt_logprobs[unit_id].is_none() {
+                                if sent_output_logprobs[unit_id] {
+                                    warn!(%request_id, "dropping late streaming prompt logprobs: a chunk with output logprobs was already sent");
+                                } else {
+                                    match prompt_logprobs_from_info(
+                                        info,
+                                        prompt_ids,
+                                        tok.as_ref(),
+                                        as_token_ids,
+                                        skip_special,
+                                        logprob_token_ids.as_deref(),
+                                    ) {
+                                        Ok(value) => prompt_logprobs[unit_id] = Some(value),
+                                        Err(error) => {
+                                            let _ = send_stream_chunk(
+                                                &tx,
+                                                &mut producer_output_frame,
+                                                error_frame(&error),
+                                                false,
+                                            );
+                                            return false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let Some(outputs) = &msg.outputs else {
+                            continue;
+                        };
+                        // Each unit's engine stream carries one sequence
+                        // (`n = 1` at the engine), so its `index` is 0; the
+                        // merged index is the unit id.
+                        let index = unit_id + outputs.index as usize;
+                        if index >= sequences.len() {
+                            sequences.resize_with(index + 1, || SequenceAccum::new(0));
+                        }
+                        while detoks.len() <= index {
+                            detoks.push(tok.as_ref().map(|tokenizer| {
+                                decode_stream(&**tokenizer, prompt_ids.as_ref(), skip_special)
+                            }));
+                        }
+                        let (delta, finish) = match sequence_text_and_finish(
+                            outputs,
+                            &mut detoks[index],
+                            prefer_worker_text,
+                        ) {
+                            Ok(output) => output,
+                            Err(error) => {
+                                let _ = send_stream_chunk(
+                                    &tx,
+                                    &mut producer_output_frame,
+                                    error_frame(&error),
+                                    false,
+                                );
+                                return false;
+                            }
+                        };
+                        let generated_output = has_generated_output(&msg, &delta);
+                        if !first_token_logged && !delta.is_empty() {
+                            stages["first_token_ms"] =
+                                serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
+                            stages["first_detok_ms"] = stages["first_token_ms"].clone();
+                            fill_engine_ms(&mut stages);
+                            if stages_on {
+                                info!(%stages, "grpc generate stages");
+                                let _ = send_stream_chunk(
+                                    &tx,
+                                    &mut producer_output_frame,
+                                    format!(": router-stages {stages}\n\n"),
+                                    false,
+                                );
+                            }
+                            first_token_logged = true;
+                        }
+                        let sequence = &mut sequences[index];
+                        completion_tokens = completion_tokens.saturating_add(outputs.num_tokens);
+                        sequence.num_tokens =
+                            sequence.num_tokens.saturating_add(outputs.num_tokens);
+                        let mut chunk_text = delta;
+                        let mut chunk_logprobs: Option<LogProbs> = None;
+                        let mut chunk_has_output_logprobs = false;
+                        let echo_now = echo && !sequence.echoed;
+                        let echo_text = meta.echo_text.as_deref();
+                        if echo_now {
+                            sequence.echoed = true;
+                            if echo_only {
+                                chunk_text = echo_text.unwrap_or_default().to_string();
+                            } else if let Some(text) = echo_text {
+                                chunk_text = format!("{text}{chunk_text}");
+                            }
+                        } else if echo_only {
+                            chunk_text.clear();
+                        }
+                        if echo_only {
+                            if echo_now {
+                                chunk_logprobs = prompt_logprobs[unit_id].clone();
+                            }
+                        } else if want_logprobs {
+                            let mut logprobs = if !prompt_logprobs_sent[unit_id] {
+                                match &prompt_logprobs[unit_id] {
+                                    Some(prompt) => {
+                                        prompt_logprobs_sent[unit_id] = true;
+                                        prompt.clone()
+                                    }
+                                    None => empty_logprobs(),
+                                }
+                            } else {
+                                empty_logprobs()
+                            };
+                            let values = optional_values(&outputs.logprobs);
+                            let start = sequence.next_offset;
+                            let tokens_before = logprobs.tokens.len();
+                            match append_logprobs(
+                                &mut logprobs,
+                                tok.as_ref(),
+                                &outputs.token_ids,
+                                &values,
+                                &outputs.candidate_tokens,
+                                as_token_ids,
+                                skip_special,
+                                logprob_token_ids.as_deref(),
+                                start,
+                            ) {
+                                Ok(next) => {
+                                    sequence.next_offset = next;
+                                    chunk_has_output_logprobs =
+                                        logprobs.tokens.len() > tokens_before;
+                                }
+                                Err(error) => {
+                                    let _ = send_stream_chunk(
+                                        &tx,
+                                        &mut producer_output_frame,
+                                        error_frame(&error),
+                                        false,
+                                    );
+                                    return false;
+                                }
+                            }
+                            if !logprobs.tokens.is_empty() {
+                                chunk_logprobs = Some(logprobs);
+                            }
+                        }
+                        if emit_token_ids {
+                            sequence.token_ids.extend_from_slice(&outputs.token_ids);
+                        }
+                        let chunk_ids = if echo_only {
+                            if echo_now && echo && emit_token_ids {
+                                Some(prompt_ids.to_vec())
+                            } else {
+                                None
+                            }
+                        } else if emit_token_ids && !outputs.token_ids.is_empty() {
+                            Some(outputs.token_ids.clone())
+                        } else {
+                            None
+                        };
+                        if !chunk_text.is_empty()
+                            || chunk_logprobs.is_some()
+                            || chunk_ids.is_some()
+                            || finish.is_some()
+                            || (first && shape == ResponseShape::Chat)
+                        {
+                            let line = sse_chunk(
+                                shape,
+                                index as u32,
+                                &request_id,
+                                &model,
+                                created,
+                                &chunk_text,
+                                first,
+                                finish.clone(),
+                                chunk_logprobs,
+                                chunk_ids,
+                            );
+                            if !send_stream_chunk(
+                                &tx,
+                                &mut producer_output_frame,
+                                line,
+                                generated_output,
+                            ) {
+                                break;
+                            }
+                            if chunk_has_output_logprobs {
+                                sent_output_logprobs[unit_id] = true;
+                            }
+                            first = false;
+                        }
+                        if finish.is_some() {
+                            sequence.finish = finish;
+                            if !finished_units[unit_id] {
+                                finished_units[unit_id] = true;
+                                finished_count += 1;
+                                if finished_count >= n_units {
+                                    if include_usage {
+                                        let prompt_total =
+                                            merged_prompt_tokens(&prompt_tokens, n_per_prompt);
+                                        let usage = Usage {
+                                            prompt_tokens: prompt_total,
+                                            completion_tokens,
+                                            total_tokens: prompt_total + completion_tokens,
+                                            completion_tokens_details: None,
+                                        };
+                                        let line = sse_usage_chunk(
+                                            shape, &request_id, &model, created, usage,
+                                        );
+                                        let _ = send_stream_chunk(
+                                            &tx,
+                                            &mut producer_output_frame,
+                                            line,
+                                            false,
+                                        );
+                                    }
+                                    let _ = send_stream_chunk(
+                                        &tx,
+                                        &mut producer_output_frame,
+                                        SSE_DONE.to_string(),
+                                        false,
+                                    );
+                                    all_done = true;
+                                }
+                            }
+                        }
+                    }
+                    Err(status) => {
+                        let _ = send_stream_chunk(
+                            &tx,
+                            &mut producer_output_frame,
+                            error_frame(status.message()),
+                            false,
+                        );
+                        return false;
+                    }
+                }
+            }
+            if !all_done {
+                let _ = send_stream_chunk(
+                    &tx,
+                    &mut producer_output_frame,
+                    error_frame("gRPC stream closed before finish_info"),
+                    false,
+                );
+                return false;
+            }
+            !sequences
+                .iter()
+                .any(|sequence| sequence.finish.as_deref() == Some("abort"))
+        }
+        .await;
+        if finished {
+            for guard in abort {
+                guard.disarm();
+            }
         } else {
             failed_tx.send_replace(true);
         }
@@ -1243,7 +1865,7 @@ async fn collect_openai(
         )
             .into_response();
     }
-    abort.disarm();
+    abort.into_iter().for_each(|guard| guard.disarm());
     if fail_on_abort
         && sequences
             .iter()
@@ -1290,6 +1912,265 @@ async fn collect_openai(
                 matched_stop: None,
                 hidden_states: None,
                 prompt_token_ids: emit_token_ids.then(|| prompt_ids.to_vec()),
+                token_ids,
+            });
+        }
+        axum::Json(completion_response(
+            &request_id,
+            &model,
+            created,
+            choices,
+            usage,
+        ))
+        .into_response()
+    };
+    if crate::backend::stages_enabled() {
+        resp.headers_mut()
+            .insert("x-router-stages", stages_header(&stages));
+        info!(%stages, "grpc generate stages");
+    }
+    resp
+}
+
+/// Non-streaming merge for Stage 3 fan-out: accumulate every unit's
+/// sequence, then build one response with choices in unit order, usage
+/// counting each prompt once, and a single shared id/model/created.
+async fn collect_openai_many(
+    unit_streams: Vec<UnitStream>,
+    metas: Vec<UnitMeta>,
+    reply: ChatReply,
+    n_per_prompt: usize,
+) -> Response {
+    let ChatReply {
+        request_id,
+        model,
+        created,
+        tok,
+        prompt_ids: _,
+        skip_special,
+        prefer_worker_text,
+        include_usage: _,
+        shape,
+        emit_token_ids,
+        completion,
+        request_timeout,
+        mut stages,
+        t_req,
+        on_first_output,
+        fail_on_abort,
+        abort,
+    } = reply;
+    let echo = completion.as_ref().is_some_and(|options| options.echo);
+    let echo_only = completion.as_ref().is_some_and(|options| options.echo_only);
+    let want_logprobs = completion
+        .as_ref()
+        .is_some_and(|options| options.logprobs.is_some());
+    let as_token_ids = completion
+        .as_ref()
+        .is_some_and(|options| options.return_tokens_as_token_ids);
+    let want_prompt_logprobs = completion
+        .as_ref()
+        .and_then(completion_prompt_logprobs)
+        .is_some();
+    let logprob_token_ids = completion
+        .as_ref()
+        .and_then(|options| options.logprob_token_ids.clone());
+    let n_units = metas.len();
+    let mut sequences: Vec<SequenceAccum> = metas
+        .iter()
+        .map(|meta| {
+            let echo_len = if echo {
+                meta.echo_text
+                    .as_deref()
+                    .map(|text| text.chars().count() as u32)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            SequenceAccum::new(echo_len)
+        })
+        .collect();
+    let mut detoks: Vec<Option<Box<dyn IncrementalDecoderTrait + '_>>> = metas
+        .iter()
+        .map(|meta| {
+            tok.as_ref().map(|tokenizer| {
+                decode_stream(&**tokenizer, meta.prompt_ids.as_ref(), skip_special)
+            })
+        })
+        .collect();
+    let mut prompt_logprobs: Vec<Option<LogProbs>> = vec![None; n_units];
+    let mut prompt_tokens: Vec<u32> = metas
+        .iter()
+        .map(|meta| meta.prompt_ids.len() as u32)
+        .collect();
+    let mut completion_tokens = 0u32;
+    let mut first_output_seen = false;
+    let mut merged = select_all(unit_streams.into_iter().map(|unit| {
+        let unit_id = unit.unit_id;
+        Box::pin(unit.stream.map(move |item| (unit_id, item)))
+    }));
+    loop {
+        let item = match tokio::time::timeout(request_timeout, merged.next()).await {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(_) => {
+                return (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "gRPC stream exceeded request timeout",
+                )
+                    .into_response();
+            }
+        };
+        let (unit_id, item) = item;
+        match item {
+            Ok(msg) => {
+                if stages.get("first_grpc_msg_ms").is_none() {
+                    stages["first_grpc_msg_ms"] =
+                        serde_json::json!(t_req.elapsed().as_secs_f64() * 1000.0);
+                }
+                let meta = &metas[unit_id];
+                let prompt_ids = &meta.prompt_ids;
+                if let Some(info) = &msg.prompt_info {
+                    prompt_tokens[unit_id] = info.num_prompt_tokens;
+                    if want_prompt_logprobs && prompt_logprobs[unit_id].is_none() {
+                        match prompt_logprobs_from_info(
+                            info,
+                            prompt_ids,
+                            tok.as_ref(),
+                            as_token_ids,
+                            skip_special,
+                            logprob_token_ids.as_deref(),
+                        ) {
+                            Ok(value) => prompt_logprobs[unit_id] = Some(value),
+                            Err(error) => {
+                                return (StatusCode::BAD_GATEWAY, error).into_response();
+                            }
+                        }
+                    }
+                }
+                let Some(outputs) = &msg.outputs else {
+                    continue;
+                };
+                // Each unit's engine stream carries one sequence
+                // (`n = 1` at the engine), so its `index` is 0; the merged
+                // index is the unit id.
+                let index = unit_id + outputs.index as usize;
+                if index >= sequences.len() {
+                    sequences.resize_with(index + 1, || SequenceAccum::new(0));
+                }
+                while detoks.len() <= index {
+                    detoks.push(tok.as_ref().map(|tokenizer| {
+                        decode_stream(&**tokenizer, prompt_ids.as_ref(), skip_special)
+                    }));
+                }
+                let (delta, finish) =
+                    match sequence_text_and_finish(outputs, &mut detoks[index], prefer_worker_text)
+                    {
+                        Ok(output) => output,
+                        Err(error) => return (StatusCode::BAD_GATEWAY, error).into_response(),
+                    };
+                let sequence = &mut sequences[index];
+                if want_logprobs {
+                    let values = optional_values(&outputs.logprobs);
+                    let start = sequence.next_offset;
+                    match append_logprobs(
+                        &mut sequence.logprobs,
+                        tok.as_ref(),
+                        &outputs.token_ids,
+                        &values,
+                        &outputs.candidate_tokens,
+                        as_token_ids,
+                        skip_special,
+                        logprob_token_ids.as_deref(),
+                        start,
+                    ) {
+                        Ok(next) => sequence.next_offset = next,
+                        Err(error) => {
+                            return (StatusCode::BAD_GATEWAY, error).into_response();
+                        }
+                    }
+                }
+                if emit_token_ids {
+                    sequence.token_ids.extend_from_slice(&outputs.token_ids);
+                }
+                sequence.text.push_str(&delta);
+                completion_tokens = completion_tokens.saturating_add(outputs.num_tokens);
+                sequence.num_tokens = sequence.num_tokens.saturating_add(outputs.num_tokens);
+                if !first_output_seen && has_generated_output(&msg, &delta) {
+                    first_output_seen = true;
+                    if let Some(callback) = &on_first_output {
+                        callback();
+                    }
+                }
+                if finish.is_some() {
+                    sequence.finish = finish;
+                }
+            }
+            Err(status) => {
+                return (
+                    grpc_status_code(&status),
+                    format!("grpc GenerateStream: {}", status.message()),
+                )
+                    .into_response();
+            }
+        }
+    }
+    if sequences.iter().any(|sequence| sequence.finish.is_none()) {
+        return (
+            StatusCode::BAD_GATEWAY,
+            "gRPC stream closed before finish_info",
+        )
+            .into_response();
+    }
+    abort.into_iter().for_each(|guard| guard.disarm());
+    if fail_on_abort
+        && sequences
+            .iter()
+            .any(|sequence| sequence.finish.as_deref() == Some("abort"))
+    {
+        warn!(%request_id, "gRPC decode finished aborted");
+        return (StatusCode::BAD_GATEWAY, "gRPC decode finished aborted").into_response();
+    }
+    let prompt_total = merged_prompt_tokens(&prompt_tokens, n_per_prompt);
+    let usage = Usage {
+        prompt_tokens: prompt_total,
+        completion_tokens,
+        total_tokens: prompt_total + completion_tokens,
+        completion_tokens_details: None,
+    };
+    let mut resp = if shape == ResponseShape::Chat {
+        let sequence = &sequences[0];
+        axum::Json(final_response(
+            &request_id,
+            &model,
+            created,
+            sequence.text.clone(),
+            sequence.finish.clone(),
+            prompt_total,
+            completion_tokens,
+        ))
+        .into_response()
+    } else {
+        let mut choices: Vec<CompletionChoice> = Vec::with_capacity(sequences.len());
+        for (index, sequence) in sequences.iter().enumerate() {
+            let meta = &metas[index];
+            let (text, logprobs, token_ids) = completion_choice_parts(
+                sequence,
+                &meta.prompt_ids,
+                meta.echo_text.as_deref(),
+                echo,
+                echo_only,
+                prompt_logprobs[index].as_ref(),
+                emit_token_ids,
+            );
+            choices.push(CompletionChoice {
+                text,
+                index: index as u32,
+                logprobs,
+                finish_reason: sequence.finish.clone(),
+                matched_stop: None,
+                hidden_states: None,
+                prompt_token_ids: emit_token_ids.then(|| meta.prompt_ids.to_vec()),
                 token_ids,
             });
         }
